@@ -5,13 +5,13 @@ from pathlib import Path
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
     QMainWindow,
     QMessageBox,
     QPushButton,
-    QComboBox,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -19,21 +19,23 @@ from PySide6.QtWidgets import (
 )
 
 from .kml_parser import analyze_file
-from .matcher import build_match_rows
+from .matcher import build_match_rows, candidates_for
 from .models import FolderInfo, KMLFileInfo, MatchRow
 from .style_sync import sync_file
 
 
 class MainWindow(QMainWindow):
+    """Standalone B-centric KML/KMZ style synchronization UI."""
+
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("KML Style Sync - Standalone")
-        self.resize(1450, 800)
+        self.resize(1500, 820)
         self.source_info: KMLFileInfo | None = None
         self.template_info: KMLFileInfo | None = None
         self.rows: list[MatchRow] = []
-        self._combo_boxes: list[QComboBox] = []
         self._building_table = False
+        self._combo_boxes: list[QComboBox] = []
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -55,29 +57,30 @@ class MainWindow(QMainWindow):
         layout.addLayout(top)
 
         hint = QLabel(
-            "运行逻辑：先完整解析 B 文件的所有 Folder、Geometry 和 Style；"
-            "再按 Folder 名称预匹配 A。A 的每个 Folder 均可手动选择 B，候选项只显示相同 Geometry。"
+            "B 是标准库：先完整解析 B 文件中的全部 Folder、Geometry 与标准 Style；"
+            "表格按 B Folder 原始顺序建立。A 仅负责选择对应 Folder；候选 A 只允许与 B 具有相同 Geometry。"
         )
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
         self.table = QTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels([
-            "A 工程 Folder",
-            "Geometry A",
-            "B 标准 Folder（可选择）",
+            "B 标准 Folder",
             "Geometry B",
             "标准 Style",
+            "A 工程 Folder（可选择）",
+            "Geometry A",
             "匹配状态",
         ])
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setAlternatingRowColors(True)
+        self.table.setWordWrap(False)
         layout.addWidget(self.table, 1)
 
         bottom = QHBoxLayout()
         self.info = QLabel("请先选择 A 工程文件和 B 标准文件")
-        refresh_btn = QPushButton("按名称重新预匹配")
+        refresh_btn = QPushButton("按名称重新匹配")
         refresh_btn.clicked.connect(self.refresh_matches)
         apply_btn = QPushButton("执行 Style 同步")
         apply_btn.clicked.connect(self.apply_sync)
@@ -96,7 +99,7 @@ class MainWindow(QMainWindow):
             self._load_source(Path(path))
 
     def choose_template(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "选择 B 标准模板文件", "", self._file_filter())
+        path, _ = QFileDialog.getOpenFileName(self, "选择 B 标准文件", "", self._file_filter())
         if path:
             self._load_template(Path(path))
 
@@ -129,62 +132,41 @@ class MainWindow(QMainWindow):
         return item
 
     @staticmethod
-    def _folder_key(folder: FolderInfo) -> str:
-        return folder.display_path
+    def _style_text(folder: FolderInfo) -> str:
+        if folder.standard_style_ambiguous:
+            return "多个最高占比 Style，需人工确认"
+        if folder.standard_style_key == "<unstyled>" or not folder.standard_style_key:
+            return "未找到 Style"
+        key = folder.standard_style_key
+        if key.startswith("inline:"):
+            return f"内联 Style ({folder.standard_style_ratio * 100:.1f}%)"
+        return f"{key} ({folder.standard_style_ratio * 100:.1f}%)"
 
-    def _matching_templates(self, source: FolderInfo) -> list[FolderInfo]:
-        if self.template_info is None:
-            return []
-        # Manual choices are restricted to B Folders having exactly the same
-        # parsed geometry type. MIXED therefore only matches MIXED.
-        return [
-            folder for folder in self.template_info.folders
-            if folder.geometry_type == source.geometry_type
-        ]
-
-    def _best_default_template(self, source: FolderInfo) -> FolderInfo | None:
-        candidates = self._matching_templates(source)
-        if not candidates:
-            return None
-        source_name = source.name.strip().casefold()
-        source_path = source.display_path.strip().casefold()
-        exact_path = [f for f in candidates if f.display_path.strip().casefold() == source_path]
-        if len(exact_path) == 1:
-            return exact_path[0]
-        exact_name = [f for f in candidates if f.name.strip().casefold() == source_name]
-        return exact_name[0] if len(exact_name) == 1 else None
-
-    def _set_combo_items(self, combo: QComboBox, source: FolderInfo, selected: FolderInfo | None) -> None:
-        combo.blockSignals(True)
-        combo.clear()
-        combo.addItem("— 不同步此 Folder —", None)
-        for folder in self._matching_templates(source):
-            combo.addItem(folder.display_path, folder)
+    def _make_a_combo(self, row_index: int, template: FolderInfo, selected: FolderInfo | None) -> QComboBox:
+        combo = QComboBox()
+        combo.setMinimumWidth(360)
+        combo.addItem("— 不同步此 B Folder —", None)
+        for source in candidates_for(template, self.source_info.folders if self.source_info else []):
+            combo.addItem(source.display_path, source)
         if selected is not None:
-            index = combo.findText(selected.display_path, Qt.MatchFlag.MatchExactly)
-            if index >= 0:
-                combo.setCurrentIndex(index)
-        combo.blockSignals(False)
+            for idx in range(combo.count()):
+                if combo.itemData(idx) is selected:
+                    combo.setCurrentIndex(idx)
+                    break
+        combo.currentIndexChanged.connect(
+            lambda _index, r=row_index, cb=combo: self._on_source_changed(r, cb)
+        )
+        return combo
 
-    def _on_template_changed(self, row_index: int, combo: QComboBox) -> None:
+    def _on_source_changed(self, row_index: int, combo: QComboBox) -> None:
         if self._building_table or row_index >= len(self.rows):
             return
-        selected = combo.currentData()
         row = self.rows[row_index]
-        row.template = selected
-        row.status = "MATCHED" if selected is not None else "UNMATCHED"
-        self._update_row_metadata(row_index, row)
-
-    def _update_row_metadata(self, row_index: int, row: MatchRow) -> None:
-        template = row.template
-        self.table.setItem(row_index, 3, self._readonly_item(template.geometry_type if template else "—"))
-        if template and template.standard_style_key and template.standard_style_key != "<unstyled>":
-            style_text = f"{template.standard_style_ratio * 100:.1f}% 使用"
-        else:
-            style_text = "无可用 Style"
-        self.table.setItem(row_index, 4, self._readonly_item(style_text))
-        status_text = "✓ 已匹配" if template else "— 未匹配"
-        self.table.setItem(row_index, 5, self._readonly_item(status_text))
+        selected = combo.currentData()
+        row.source = selected
+        row.status = "MANUAL_MATCHED" if selected is not None else "UNMATCHED"
+        self.table.setItem(row_index, 4, self._readonly_item(selected.geometry_type if selected else "—"))
+        self.table.setItem(row_index, 5, self._readonly_item("✓ 手动匹配" if selected else "— 未匹配"))
 
     def refresh_matches(self) -> None:
         if self.source_info is None or self.template_info is None:
@@ -192,43 +174,49 @@ class MainWindow(QMainWindow):
             self._combo_boxes.clear()
             return
 
-        # This is the only automatic matching stage: B is parsed first, then
-        # A is matched by Folder path/name + identical Geometry. Every A row
-        # remains manually selectable afterwards.
+        # B controls the row set and therefore the visible order. The matcher
+        # performs only exact normalized-name/path + geometry matching; it never
+        # guesses from geometry alone.
         self.rows = build_match_rows(self.source_info.folders, self.template_info.folders)
         self.table.setRowCount(len(self.rows))
         self._combo_boxes = []
         self._building_table = True
         try:
             for i, row in enumerate(self.rows):
-                source = row.source
-                default_template = self._best_default_template(source)
-                row.template = default_template
-                row.status = "MATCHED" if default_template else "UNMATCHED"
+                template = row.template
+                self.table.setItem(i, 0, self._readonly_item(template.display_path, template.display_path))
+                self.table.setItem(i, 1, self._readonly_item(template.geometry_type))
+                self.table.setItem(i, 2, self._readonly_item(self._style_text(template), template.standard_style_xml))
 
-                self.table.setItem(i, 0, self._readonly_item(source.display_path, source.display_path))
-                self.table.setItem(i, 1, self._readonly_item(source.geometry_type))
-
-                combo = QComboBox()
-                combo.setMinimumWidth(300)
-                self._set_combo_items(combo, source, default_template)
-                combo.currentIndexChanged.connect(
-                    lambda _index, row_index=i, cb=combo: self._on_template_changed(row_index, cb)
-                )
-                self.table.setCellWidget(i, 2, combo)
+                combo = self._make_a_combo(i, template, row.source)
+                self.table.setCellWidget(i, 3, combo)
                 self._combo_boxes.append(combo)
-                self._update_row_metadata(i, row)
+
+                source = combo.currentData()
+                row.source = source
+                if source is None:
+                    row.status = "UNMATCHED"
+                elif row.status not in {"AUTO_MATCHED", "MATCHED"}:
+                    row.status = "AUTO_MATCHED"
+                self.table.setItem(i, 4, self._readonly_item(source.geometry_type if source else "—"))
+                self.table.setItem(
+                    i,
+                    5,
+                    self._readonly_item(
+                        "✓ 自动匹配" if row.status == "AUTO_MATCHED" else "⚠ 名称重复" if row.status == "AMBIGUOUS" else "— 未匹配"
+                    ),
+                )
         finally:
             self._building_table = False
 
         self.table.resizeColumnsToContents()
-        self.table.setColumnWidth(0, max(280, self.table.columnWidth(0)))
-        self.table.setColumnWidth(2, max(320, self.table.columnWidth(2)))
-        matched = sum(r.template is not None for r in self.rows)
+        self.table.setColumnWidth(0, max(300, self.table.columnWidth(0)))
+        self.table.setColumnWidth(2, max(260, self.table.columnWidth(2)))
+        self.table.setColumnWidth(3, max(380, self.table.columnWidth(3)))
+        matched = sum(row.source is not None for row in self.rows)
         self.info.setText(
-            f"A Folder：{len(self.source_info.folders)} | "
-            f"B Folder：{len(self.template_info.folders)} | 当前匹配：{matched} | "
-            "下拉框候选仅允许选择相同 Geometry 的 B Folder"
+            f"A Folder：{len(self.source_info.folders)} | B Folder：{len(self.template_info.folders)} | "
+            f"当前匹配：{matched} | B 顺序固定 | A 候选按 Geometry 过滤"
         )
 
     def apply_sync(self) -> None:
@@ -236,14 +224,25 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "无法同步", "请先选择 A 工程文件和 B 标准文件。")
             return
 
-        mappings: dict[tuple[str, ...], tuple[str, ...]] = {
-            row.source.folder_path: row.template.folder_path
-            for row in self.rows
-            if row.template is not None and row.status == "MATCHED"
-        }
+        mappings: dict[tuple[str, ...], tuple[str, ...]] = {}
+        blocked: list[str] = []
+        for row in self.rows:
+            if row.source is None:
+                continue
+            if row.template.standard_style_ambiguous or row.template.standard_style_key in {None, "<unstyled>"}:
+                blocked.append(row.template.display_path)
+                continue
+            mappings[row.source.folder_path] = row.template.folder_path
+
         if not mappings:
-            QMessageBox.warning(self, "无法同步", "没有可用的 Folder 匹配关系。")
+            QMessageBox.warning(self, "无法同步", "没有可执行的 Folder 匹配关系。请检查 A 选择和 B Style。")
             return
+        if blocked:
+            QMessageBox.warning(
+                self,
+                "存在需人工确认的 B Style",
+                "以下 B Folder 没有唯一标准 Style，因此不会同步：\n\n" + "\n".join(blocked),
+            )
 
         suffix = self.source_info.file_path.suffix.lower()
         default_name = f"{self.source_info.file_path.stem}_StyleSynced{suffix}"
@@ -260,19 +259,14 @@ class MainWindow(QMainWindow):
             output_path = output_path.with_suffix(suffix)
 
         try:
-            result = sync_file(
-                self.source_info.file_path,
-                self.template_info.file_path,
-                output_path,
-                mappings,
-            )
+            result = sync_file(self.source_info.file_path, self.template_info.file_path, output_path, mappings)
         except Exception as exc:
             QMessageBox.critical(self, "同步失败", str(exc))
             return
 
         msg = (
             "同步完成\n\n"
-            f"处理 Folder：{len(mappings)}\n"
+            f"处理映射：{len(mappings)}\n"
             f"修改 Placemark：{result.placemarks_changed}\n"
             f"同步 Style：{result.styles_changed}\n"
             f"输出：{result.output_path}"
