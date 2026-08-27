@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-import logging
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -49,7 +48,7 @@ def _resolve_style(root: etree._Element, style_url: str | None, visited: set[str
     sid = _local_id(style_url)
     if not sid:
         return None
-    visited = visited or set()
+    visited = set() if visited is None else set(visited)
     if sid in visited:
         log.warning("STYLE CYCLE: %s", sid)
         return None
@@ -94,9 +93,8 @@ def _read_kml(path: Path) -> tuple[bytes, str | None]:
     if path.suffix.lower() == ".kml":
         return path.read_bytes(), None
     with zipfile.ZipFile(path, "r") as zf:
-        names = zf.namelist()
-        kml_name = next((n for n in names if Path(n).name.lower() == "doc.kml"), None)
-        kml_name = kml_name or next((n for n in names if n.lower().endswith(".kml")), None)
+        kml_name = next((n for n in zf.namelist() if Path(n).name.lower() == "doc.kml"), None)
+        kml_name = kml_name or next((n for n in zf.namelist() if n.lower().endswith(".kml")), None)
         if not kml_name:
             raise ValueError(f"KMZ does not contain a KML file: {path}")
         return zf.read(kml_name), kml_name
@@ -117,37 +115,50 @@ def _folder_name(folder: etree._Element, index: int) -> str:
 
 
 def _folder_index(root: etree._Element) -> dict[tuple[str, ...], etree._Element]:
-    """Build the same Folder path model used by the parser."""
     result: dict[tuple[str, ...], etree._Element] = {}
 
     def walk(parent: etree._Element, parent_path: tuple[str, ...]) -> None:
-        folders = parent.xpath("./k:Folder", namespaces=NSMAP)
-        for i, folder in enumerate(folders, 1):
-            name = _folder_name(folder, i)
+        for index, folder in enumerate(parent.xpath("./k:Folder", namespaces=NSMAP), 1):
+            name = _folder_name(folder, index)
             path = parent_path + (name,)
             result[path] = folder
             walk(folder, path)
 
-    # Document may be nested below kml; start from all top-level Folder elements
-    # whose parent is not itself a Folder.
     roots = root.xpath(".//k:Folder[not(ancestor::k:Folder)]", namespaces=NSMAP)
-    for i, folder in enumerate(roots, 1):
-        name = _folder_name(folder, i)
+    for index, folder in enumerate(roots, 1):
+        name = _folder_name(folder, index)
         path = (name,)
         result[path] = folder
         walk(folder, path)
     return result
 
 
+def _standard_style_for_folder(root: etree._Element, folder: etree._Element, label: str) -> tuple[etree._Element | None, str | None]:
+    placemarks = folder.xpath("./k:Placemark", namespaces=NSMAP)
+    counts: dict[bytes, int] = {}
+    style_by_sig: dict[bytes, etree._Element] = {}
+    for pm in placemarks:
+        style = _resolve_pm_style(root, pm)
+        if style is None:
+            continue
+        sig = _style_signature(style)
+        counts[sig] = counts.get(sig, 0) + 1
+        style_by_sig[sig] = style
+    if not counts:
+        return None, f"B Folder 没有可用 Style：{label}"
+    maximum = max(counts.values())
+    winners = [sig for sig, count in counts.items() if count == maximum]
+    if len(winners) > 1:
+        return None, f"B Folder 存在多个最高占比 Style，需人工确认：{label}"
+    return style_by_sig[winners[0]], None
+
+
 def _apply_to_folder(root: etree._Element, folder_path: tuple[str, ...], standard: etree._Element) -> int:
-    folders = _folder_index(root)
-    folder = folders.get(folder_path)
+    folder = _folder_index(root).get(folder_path)
     if folder is None:
         log.warning("SOURCE FOLDER NOT FOUND: %s", " / ".join(folder_path))
         return 0
     changed = 0
-    # Only direct Placemarks belong to this Folder row. Nested Folder styles are
-    # intentionally left untouched and are handled by their own mapping rows.
     for pm in folder.xpath("./k:Placemark", namespaces=NSMAP):
         _replace_style(pm, standard)
         changed += 1
@@ -155,53 +166,37 @@ def _apply_to_folder(root: etree._Element, folder_path: tuple[str, ...], standar
 
 
 def sync_file(source: Path, template: Path, output: Path, mappings: dict[tuple[str, ...], tuple[str, ...]]) -> SyncResult:
-    """Synchronize styles from B Folders into matching A Folders in one file."""
     source = Path(source)
     template = Path(template)
     output = Path(output)
     log.info("SYNC START A=%s B=%s OUTPUT=%s MAPPINGS=%d", source, template, output, len(mappings))
     if source.resolve() == output.resolve():
         raise ValueError("输出文件不能覆盖 A 原始工程文件，请选择新的输出文件。")
-    if template.suffix.lower() != source.suffix.lower():
-        raise ValueError("A 工程与输出文件的扩展名必须保持一致（KML 对 KML，KMZ 对 KMZ）。")
+    if output.suffix.lower() != source.suffix.lower():
+        raise ValueError("A 工程与输出文件的扩展名必须保持一致。")
 
     src_data, src_kml_name = _read_kml(source)
     tpl_data, _ = _read_kml(template)
     src_root = _parse(src_data, str(source))
     tpl_root = _parse(tpl_data, str(template))
-
     template_folders = _folder_index(tpl_root)
     warnings: list[str] = []
     changed = 0
-    styles_changed = 0
 
     for source_path, template_path in mappings.items():
-        log.info("MAPPING A=%s <- B=%s", " / ".join(source_path), " / ".join(template_path))
+        label = " / ".join(template_path)
+        log.info("MAPPING A=%s <- B=%s", " / ".join(source_path), label)
         template_folder = template_folders.get(template_path)
         if template_folder is None:
-            message = f"B Folder 不存在：{' / '.join(template_path)}"
-            warnings.append(message)
-            log.error(message)
+            warnings.append(f"B Folder 不存在：{label}")
             continue
-        template_pms = template_folder.xpath("./k:Placemark", namespaces=NSMAP)
-        counts: dict[bytes, int] = {}
-        style_by_sig: dict[bytes, etree._Element] = {}
-        for pm in template_pms:
-            style = _resolve_pm_style(tpl_root, pm)
-            if style is None:
-                continue
-            sig = _style_signature(style)
-            counts[sig] = counts.get(sig, 0) + 1
-            style_by_sig[sig] = style
-        if not counts:
-            message = f"B Folder 没有可用 Style：{' / '.join(template_path)}"
-            warnings.append(message)
-            log.warning(message)
+        standard, error = _standard_style_for_folder(tpl_root, template_folder, label)
+        if error:
+            warnings.append(error)
             continue
-        standard = style_by_sig[max(counts, key=counts.get)]
+        assert standard is not None
         file_changed = _apply_to_folder(src_root, source_path, standard)
         changed += file_changed
-        styles_changed += file_changed
         log.info("STYLE APPLIED folder=%s placemarks=%d", " / ".join(source_path), file_changed)
 
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -212,5 +207,4 @@ def sync_file(source: Path, template: Path, output: Path, mappings: dict[tuple[s
             for item in zin.infolist():
                 data = _serialize(src_root) if item.filename == src_kml_name else zin.read(item.filename)
                 zout.writestr(item, data)
-    log.info("SYNC COMPLETE changed=%d warnings=%d output=%s", changed, len(warnings), output)
-    return SyncResult(output, changed, styles_changed, warnings)
+    return SyncResult(output, changed, changed, warnings)
