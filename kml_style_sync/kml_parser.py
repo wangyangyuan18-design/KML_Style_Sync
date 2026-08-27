@@ -29,75 +29,109 @@ def _read_kml_bytes(path: Path) -> bytes:
             candidate = next((n for n in names if Path(n).name.lower() == "doc.kml"), None)
             candidate = candidate or next((n for n in names if n.lower().endswith(".kml")), None)
             if candidate is None:
-                raise ValueError(f"No KML found in {path}")
-            log.debug("READ KMZ KML=%s members=%d", candidate, len(names))
+                raise ValueError(f"KMZ 中没有 KML：{path}")
             return archive.read(candidate)
-    raise ValueError(f"Unsupported input file: {path}")
+    raise ValueError(f"不支持的文件：{path}")
 
 
 def load_tree(path: Path) -> etree._Element:
-    return etree.fromstring(
-        _read_kml_bytes(Path(path)),
-        etree.XMLParser(remove_blank_text=False, recover=False),
-    )
+    return etree.fromstring(_read_kml_bytes(Path(path)), etree.XMLParser(remove_blank_text=False, recover=False))
 
 
 def _geometry_type(placemarks: list[etree._Element]) -> GeometryType:
     found: set[str] = set()
-    checks = (("Point", "POINT"), ("LineString", "LINE"), ("Polygon", "POLYGON"))
     for pm in placemarks:
-        for xml_name, kind in checks:
-            if pm.xpath(f".//kml:{xml_name}", namespaces=NS):
-                found.add(kind)
+        if pm.xpath(".//kml:Point", namespaces=NS):
+            found.add("POINT")
+        if pm.xpath(".//kml:LineString", namespaces=NS):
+            found.add("LINE")
+        if pm.xpath(".//kml:Polygon", namespaces=NS):
+            found.add("POLYGON")
     if len(found) == 1:
         return next(iter(found))  # type: ignore[return-value]
-    if found:
+    if len(found) > 1:
         return "MIXED"
     return "UNKNOWN"
 
 
 def _style_table(root: etree._Element) -> dict[str, etree._Element]:
-    table = {
+    return {
         f"#{style.get('id')}": style
         for style in root.xpath(".//kml:Style[@id]", namespaces=NS)
         if style.get("id")
     }
-    for style_map in root.xpath(".//kml:StyleMap[@id]", namespaces=NS):
-        refs = style_map.xpath(
-            "./kml:Pair[kml:key='normal']/kml:styleUrl/text()", namespaces=NS
-        )
-        if refs and refs[0].strip() in table:
-            table[f"#{style_map.get('id')}"] = table[refs[0].strip()]
-    return table
+
+
+def _style_maps(root: etree._Element) -> dict[str, etree._Element]:
+    return {
+        f"#{style_map.get('id')}": style_map
+        for style_map in root.xpath(".//kml:StyleMap[@id]", namespaces=NS)
+        if style_map.get("id")
+    }
+
+
+def _local_style_id(value: str | None) -> str:
+    return (value or "").strip().lstrip("#").split("/")[-1]
+
+
+def _resolve_style(root: etree._Element, style_url: str | None, visited: set[str] | None = None) -> etree._Element | None:
+    sid = _local_style_id(style_url)
+    if not sid:
+        return None
+    visited = set() if visited is None else set(visited)
+    if sid in visited:
+        log.warning("STYLE CYCLE: %s", sid)
+        return None
+    visited.add(sid)
+    direct = _style_table(root).get(f"#{sid}")
+    if direct is not None:
+        return direct
+    style_map = _style_maps(root).get(f"#{sid}")
+    if style_map is None:
+        return None
+    fallback: str | None = None
+    for pair in style_map.xpath("./kml:Pair", namespaces=NS):
+        key = (pair.findtext(f"{{{KML_NS}}}key") or "").strip()
+        url = (pair.findtext(f"{{{KML_NS}}}styleUrl") or "").strip()
+        if not url:
+            continue
+        if key in {"normalKey", "normal"}:
+            return _resolve_style(root, url, visited)
+        fallback = fallback or url
+    return _resolve_style(root, fallback, visited) if fallback else None
 
 
 def _inline_key(style: etree._Element) -> str:
     return "inline:" + etree.tostring(style, method="c14n").decode("utf-8")
 
 
-def _style_usage(
-    root: etree._Element, placemarks: list[etree._Element]
-) -> tuple[dict[str, int], str | None, str | None]:
-    styles = _style_table(root)
-    usage: Counter[str] = Counter()
-    for pm in placemarks:
-        inline = pm.find(f"{{{KML_NS}}}Style")
-        style_url = pm.findtext(f"{{{KML_NS}}}styleUrl")
-        if inline is not None:
-            usage[_inline_key(inline)] += 1
-        elif style_url and style_url.strip():
-            usage[style_url.strip()] += 1
-        else:
-            usage["<unstyled>"] += 1
-    standard = max(usage, key=usage.get) if usage else None
-    if not standard or standard == "<unstyled>":
-        return dict(usage), standard, None
+def _effective_style_key(root: etree._Element, placemark: etree._Element) -> str:
+    inline = placemark.find(f"{{{KML_NS}}}Style")
+    if inline is not None:
+        return _inline_key(inline)
+    url = placemark.findtext(f"{{{KML_NS}}}styleUrl")
+    style = _resolve_style(root, url)
+    if style is None:
+        return "<unstyled>"
+    sid = style.get("id")
+    return f"#{sid}" if sid else _inline_key(style)
+
+
+def _style_usage(root: etree._Element, placemarks: list[etree._Element]) -> tuple[dict[str, int], str | None, str | None, bool]:
+    usage: Counter[str] = Counter(_effective_style_key(root, pm) for pm in placemarks)
+    usable = {key: count for key, count in usage.items() if key != "<unstyled>"}
+    if not usable:
+        return dict(usage), "<unstyled>", None, False
+    maximum = max(usable.values())
+    winners = [key for key, count in usable.items() if count == maximum]
+    if len(winners) > 1:
+        return dict(usage), None, None, True
+    standard = winners[0]
     if standard.startswith("inline:"):
-        xml = standard[len("inline:"):]
-    else:
-        style = styles.get(standard)
-        xml = etree.tostring(style, encoding="unicode") if style is not None else None
-    return dict(usage), standard, xml
+        return dict(usage), standard, standard[len("inline:"):], False
+    style = _style_table(root).get(standard)
+    xml = etree.tostring(style, encoding="unicode") if style is not None else None
+    return dict(usage), standard, xml, False
 
 
 def _folder_name(folder: etree._Element, index: int) -> str:
@@ -105,14 +139,10 @@ def _folder_name(folder: etree._Element, index: int) -> str:
     return value or f"(未命名 Folder {index})"
 
 
-def _build_folder_info(
-    root: etree._Element,
-    folder: etree._Element,
-    folder_path: tuple[str, ...],
-) -> FolderInfo:
+def _build_folder_info(root: etree._Element, folder: etree._Element, folder_path: tuple[str, ...]) -> FolderInfo:
     placemarks = folder.xpath("./kml:Placemark", namespaces=NS)
-    usage, standard, standard_xml = _style_usage(root, placemarks)
-    info = FolderInfo(
+    usage, standard, standard_xml, ambiguous = _style_usage(root, placemarks)
+    return FolderInfo(
         name=folder_path[-1],
         folder_path=folder_path,
         geometry_type=_geometry_type(placemarks),
@@ -120,25 +150,12 @@ def _build_folder_info(
         style_usage=usage,
         standard_style_key=standard,
         standard_style_xml=standard_xml,
+        standard_style_ambiguous=ambiguous,
     )
-    log.debug(
-        "FOLDER: path=%s geometry=%s placemarks=%d standard=%s",
-        info.display_path,
-        info.geometry_type,
-        info.feature_count,
-        info.standard_style_key,
-    )
-    return info
 
 
-def _walk_folders(
-    root: etree._Element,
-    parent: etree._Element,
-    parent_path: tuple[str, ...],
-    result: list[FolderInfo],
-) -> None:
-    folders = parent.xpath("./kml:Folder", namespaces=NS)
-    for index, folder in enumerate(folders, 1):
+def _walk_folders(root: etree._Element, parent: etree._Element, parent_path: tuple[str, ...], result: list[FolderInfo]) -> None:
+    for index, folder in enumerate(parent.xpath("./kml:Folder", namespaces=NS), 1):
         name = _folder_name(folder, index)
         path = parent_path + (name,)
         result.append(_build_folder_info(root, folder, path))
@@ -152,19 +169,31 @@ def analyze_file(path: Path) -> KMLFileInfo:
     log.info("ANALYZE FILE START: %s", path)
     root = load_tree(path)
     result: list[FolderInfo] = []
-    # Start only at top-level Folders. Nested Folders are discovered recursively.
     roots = root.xpath(".//kml:Folder[not(ancestor::kml:Folder)]", namespaces=NS)
     for index, folder in enumerate(roots, 1):
         name = _folder_name(folder, index)
-        path_tuple = (name,)
-        result.append(_build_folder_info(root, folder, path_tuple))
-        _walk_folders(root, folder, path_tuple, result)
+        folder_path = (name,)
+        result.append(_build_folder_info(root, folder, folder_path))
+        _walk_folders(root, folder, folder_path, result)
+
+    if not result:
+        placemarks = root.xpath(".//kml:Placemark", namespaces=NS)
+        usage, standard, standard_xml, ambiguous = _style_usage(root, placemarks)
+        result.append(FolderInfo(
+            name=path.stem,
+            folder_path=(path.stem,),
+            geometry_type=_geometry_type(placemarks),
+            feature_count=len(placemarks),
+            style_usage=usage,
+            standard_style_key=standard,
+            standard_style_xml=standard_xml,
+            standard_style_ambiguous=ambiguous,
+        ))
     log.info("ANALYZE FILE COMPLETE: folders=%d", len(result))
     return KMLFileInfo(file_path=path, folders=result)
 
 
 def scan_project(path: Path) -> list[FolderInfo]:
-    """Compatibility wrapper: a selected input is exactly one KML/KMZ file."""
     return analyze_file(Path(path)).folders
 
 
