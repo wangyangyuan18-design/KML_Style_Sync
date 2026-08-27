@@ -9,7 +9,7 @@ GeometryType = Literal["POINT", "LINE", "POLYGON", "MIXED", "UNKNOWN"]
 
 @dataclass(slots=True)
 class FolderInfo:
-    """Information derived from one KML Folder and its direct Placemarks."""
+    """Metadata parsed from one KML Folder in document order."""
 
     name: str
     folder_path: tuple[str, ...]
@@ -18,6 +18,7 @@ class FolderInfo:
     style_usage: dict[str, int] = field(default_factory=dict)
     standard_style_key: str | None = None
     standard_style_xml: str | None = None
+    standard_style_ambiguous: bool = False
 
     @property
     def display_path(self) -> str:
@@ -29,10 +30,18 @@ class FolderInfo:
             return 0.0
         return self.style_usage.get(self.standard_style_key, 0) / self.feature_count
 
+    @property
+    def style_status(self) -> str:
+        if self.standard_style_ambiguous:
+            return "需人工确认"
+        if self.standard_style_key == "<unstyled>" or not self.standard_style_key:
+            return "未找到"
+        return f"{self.standard_style_ratio * 100:.1f}%"
+
 
 @dataclass(slots=True)
 class KMLFileInfo:
-    """One selected KML/KMZ input file and the Folders found inside it."""
+    """One selected KML/KMZ file and all of its KML Folders."""
 
     file_path: Path
     folders: list[FolderInfo] = field(default_factory=list)
@@ -40,8 +49,8 @@ class KMLFileInfo:
 
 @dataclass(slots=True)
 class MatchRow:
-    """A read-only matching result: A Folder -> B template Folder."""
+    """One B-standard Folder row with an optional A-side match."""
 
-    source: FolderInfo
-    template: FolderInfo | None = None
+    template: FolderInfo
+    source: FolderInfo | None = None
     status: str = "UNMATCHED"
