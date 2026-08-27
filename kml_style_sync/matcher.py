@@ -8,42 +8,51 @@ def _path_key(folder: FolderInfo) -> tuple[str, ...]:
     return tuple(normalize_name(part) for part in folder.folder_path)
 
 
-def build_match_rows(source_folders: list[FolderInfo], template_folders: list[FolderInfo]) -> list[MatchRow]:
-    """Create one row for every A Folder.
+def _exact_matches(source_folders: list[FolderInfo], template: FolderInfo) -> list[FolderInfo]:
+    return [
+        source for source in source_folders
+        if source.geometry_type == template.geometry_type
+        and _path_key(source) == _path_key(template)
+    ]
 
-    B is the authoritative template catalogue. Automatic matching is only a
-    convenience: exact full-path match first, then unique Folder-name match.
-    Geometry must be identical. The UI always lets the user override the
-    automatic choice with a geometry-filtered B Folder combo box.
+
+def _name_matches(source_folders: list[FolderInfo], template: FolderInfo) -> list[FolderInfo]:
+    return [
+        source for source in source_folders
+        if source.geometry_type == template.geometry_type
+        and normalize_name(source.name) == normalize_name(template.name)
+    ]
+
+
+def build_match_rows(source_folders: list[FolderInfo], template_folders: list[FolderInfo]) -> list[MatchRow]:
+    """Build one row for every B Folder, preserving B document order.
+
+    Automatic matching is deliberately conservative:
+      1. normalized full Folder path + identical Geometry;
+      2. normalized Folder name + identical Geometry;
+      3. otherwise leave A empty.
+
+    No fuzzy matching and no geometry-only guessing are performed.
     """
     rows: list[MatchRow] = []
-    for source in source_folders:
-        exact = [
-            template for template in template_folders
-            if _path_key(template) == _path_key(source)
-            and template.geometry_type == source.geometry_type
-        ]
+    for template in template_folders:
+        exact = _exact_matches(source_folders, template)
         if len(exact) == 1:
-            rows.append(MatchRow(source=source, template=exact[0], status="MATCHED"))
+            rows.append(MatchRow(template=template, source=exact[0], status="AUTO_MATCHED"))
             continue
-
-        by_name = [
-            template for template in template_folders
-            if normalize_name(template.name) == normalize_name(source.name)
-            and template.geometry_type == source.geometry_type
-        ]
+        by_name = _name_matches(source_folders, template)
         if len(by_name) == 1:
-            rows.append(MatchRow(source=source, template=by_name[0], status="MATCHED"))
+            rows.append(MatchRow(template=template, source=by_name[0], status="AUTO_MATCHED"))
         elif len(by_name) > 1:
-            rows.append(MatchRow(source=source, status="AMBIGUOUS"))
+            rows.append(MatchRow(template=template, source=None, status="AMBIGUOUS"))
         else:
-            rows.append(MatchRow(source=source, status="UNMATCHED"))
+            rows.append(MatchRow(template=template, source=None, status="UNMATCHED"))
     return rows
 
 
-def candidates_for(source: FolderInfo, template_folders: list[FolderInfo]) -> list[FolderInfo]:
-    """All B Folder choices allowed for this A Folder: same Geometry only."""
+def candidates_for(template: FolderInfo, source_folders: list[FolderInfo]) -> list[FolderInfo]:
+    """All A Folder choices allowed for a B row: identical Geometry only."""
     return [
-        folder for folder in template_folders
-        if folder.geometry_type == source.geometry_type
+        folder for folder in source_folders
+        if folder.geometry_type == template.geometry_type
     ]
