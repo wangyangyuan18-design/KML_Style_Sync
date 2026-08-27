@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import zipfile
 from collections import Counter
 from pathlib import Path
@@ -15,7 +16,9 @@ log = get_logger()
 
 
 def normalize_name(value: str) -> str:
-    return " ".join(value.strip().lower().split())
+    text = value.strip()
+    text = re.sub(r"\.(?:kml|kmz)$", "", text, flags=re.IGNORECASE)
+    return " ".join(text.split()).casefold()
 
 
 def _read_kml_bytes(path: Path) -> bytes:
@@ -71,7 +74,10 @@ def _style_maps(root: etree._Element) -> dict[str, etree._Element]:
 
 
 def _local_style_id(value: str | None) -> str:
-    return (value or "").strip().lstrip("#").split("/")[-1]
+    text = (value or "").strip()
+    if "#" in text:
+        text = text.rsplit("#", 1)[1]
+    return text.lstrip("#").split("/")[-1]
 
 
 def _resolve_style(root: etree._Element, style_url: str | None, visited: set[str] | None = None) -> etree._Element | None:
