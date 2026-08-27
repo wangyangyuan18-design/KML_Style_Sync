@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from pathlib import Path
 
 from PySide6.QtCore import Qt
@@ -175,6 +176,20 @@ class MainWindow(QMainWindow):
             status = "✓ 手动匹配"
         self.table.setItem(row_index, 4, self._readonly_item(geometry_a))
         self.table.setItem(row_index, 5, self._readonly_item(status))
+        self._refresh_duplicate_statuses()
+
+    def _refresh_duplicate_statuses(self) -> None:
+        """Show duplicate A assignments without changing the user's choices."""
+        by_source: dict[tuple[str, ...], list[int]] = defaultdict(list)
+        for index, row in enumerate(self.rows):
+            if row.source is not None:
+                by_source[row.source.folder_path].append(index)
+
+        for indices in by_source.values():
+            if len(indices) <= 1:
+                continue
+            for index in indices:
+                self.table.setItem(index, 5, self._readonly_item("⚠ A Folder 重复使用"))
 
     def refresh_matches(self) -> None:
         if self.source_info is None or self.template_info is None:
@@ -209,6 +224,7 @@ class MainWindow(QMainWindow):
         finally:
             self._building_table = False
 
+        self._refresh_duplicate_statuses()
         self.table.resizeColumnsToContents()
         self.table.setColumnWidth(0, max(300, self.table.columnWidth(0)))
         self.table.setColumnWidth(2, max(300, self.table.columnWidth(2)))
@@ -222,6 +238,22 @@ class MainWindow(QMainWindow):
     def apply_sync(self) -> None:
         if self.source_info is None or self.template_info is None:
             QMessageBox.warning(self, "无法同步", "请先选择 A 工程文件和 B 标准文件。")
+            return
+
+        duplicate_rows: dict[tuple[str, ...], list[str]] = defaultdict(list)
+        for row in self.rows:
+            if row.source is not None:
+                duplicate_rows[row.source.folder_path].append(row.template.display_path)
+        duplicates = {path: rows for path, rows in duplicate_rows.items() if len(rows) > 1}
+        if duplicates:
+            details = []
+            for path, b_rows in duplicates.items():
+                details.append(f"A：{' / '.join(path)}\nB：{'、'.join(b_rows)}")
+            QMessageBox.warning(
+                self,
+                "A Folder 重复匹配",
+                "同一个 A Folder 不能同时套用多个 B 标准 Style，请先修改：\n\n" + "\n\n".join(details),
+            )
             return
 
         mappings: dict[tuple[str, ...], tuple[str, ...]] = {}
