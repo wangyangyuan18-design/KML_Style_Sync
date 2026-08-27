@@ -58,7 +58,7 @@ class MainWindow(QMainWindow):
 
         hint = QLabel(
             "B 是标准库：先完整解析 B 文件中的全部 Folder、Geometry 与标准 Style；"
-            "表格按 B Folder 原始顺序建立。A 仅负责选择对应 Folder；候选 A 只允许与 B 具有相同 Geometry。"
+            "表格严格按 B Folder 原始顺序建立。A 仅负责选择对应 Folder；候选 A 只允许与 B 具有相同 Geometry。"
         )
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -76,6 +76,7 @@ class MainWindow(QMainWindow):
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setAlternatingRowColors(True)
         self.table.setWordWrap(False)
+        self.table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         layout.addWidget(self.table, 1)
 
         bottom = QHBoxLayout()
@@ -144,7 +145,7 @@ class MainWindow(QMainWindow):
 
     def _make_a_combo(self, row_index: int, template: FolderInfo, selected: FolderInfo | None) -> QComboBox:
         combo = QComboBox()
-        combo.setMinimumWidth(360)
+        combo.setMinimumWidth(380)
         combo.addItem("— 不同步此 B Folder —", None)
         for source in candidates_for(template, self.source_info.folders if self.source_info else []):
             combo.addItem(source.display_path, source)
@@ -164,9 +165,16 @@ class MainWindow(QMainWindow):
         row = self.rows[row_index]
         selected = combo.currentData()
         row.source = selected
-        row.status = "MANUAL_MATCHED" if selected is not None else "UNMATCHED"
-        self.table.setItem(row_index, 4, self._readonly_item(selected.geometry_type if selected else "—"))
-        self.table.setItem(row_index, 5, self._readonly_item("✓ 手动匹配" if selected else "— 未匹配"))
+        if selected is None:
+            row.status = "UNMATCHED"
+            geometry_a = "—"
+            status = "— 未匹配"
+        else:
+            row.status = "MANUAL_MATCHED"
+            geometry_a = selected.geometry_type
+            status = "✓ 手动匹配"
+        self.table.setItem(row_index, 4, self._readonly_item(geometry_a))
+        self.table.setItem(row_index, 5, self._readonly_item(status))
 
     def refresh_matches(self) -> None:
         if self.source_info is None or self.template_info is None:
@@ -174,9 +182,6 @@ class MainWindow(QMainWindow):
             self._combo_boxes.clear()
             return
 
-        # B controls the row set and therefore the visible order. The matcher
-        # performs only exact normalized-name/path + geometry matching; it never
-        # guesses from geometry alone.
         self.rows = build_match_rows(self.source_info.folders, self.template_info.folders)
         self.table.setRowCount(len(self.rows))
         self._combo_boxes = []
@@ -184,39 +189,34 @@ class MainWindow(QMainWindow):
         try:
             for i, row in enumerate(self.rows):
                 template = row.template
+                source = row.source
+
                 self.table.setItem(i, 0, self._readonly_item(template.display_path, template.display_path))
                 self.table.setItem(i, 1, self._readonly_item(template.geometry_type))
                 self.table.setItem(i, 2, self._readonly_item(self._style_text(template), template.standard_style_xml))
 
-                combo = self._make_a_combo(i, template, row.source)
+                combo = self._make_a_combo(i, template, source)
                 self.table.setCellWidget(i, 3, combo)
                 self._combo_boxes.append(combo)
 
-                source = combo.currentData()
-                row.source = source
                 if source is None:
-                    row.status = "UNMATCHED"
-                elif row.status not in {"AUTO_MATCHED", "MATCHED"}:
-                    row.status = "AUTO_MATCHED"
-                self.table.setItem(i, 4, self._readonly_item(source.geometry_type if source else "—"))
-                self.table.setItem(
-                    i,
-                    5,
-                    self._readonly_item(
-                        "✓ 自动匹配" if row.status == "AUTO_MATCHED" else "⚠ 名称重复" if row.status == "AMBIGUOUS" else "— 未匹配"
-                    ),
-                )
+                    self.table.setItem(i, 4, self._readonly_item("—"))
+                    status = "⚠ 名称重复，需手动选择" if row.status == "AMBIGUOUS" else "— 未匹配"
+                else:
+                    self.table.setItem(i, 4, self._readonly_item(source.geometry_type))
+                    status = "✓ 自动匹配"
+                self.table.setItem(i, 5, self._readonly_item(status))
         finally:
             self._building_table = False
 
         self.table.resizeColumnsToContents()
         self.table.setColumnWidth(0, max(300, self.table.columnWidth(0)))
-        self.table.setColumnWidth(2, max(260, self.table.columnWidth(2)))
-        self.table.setColumnWidth(3, max(380, self.table.columnWidth(3)))
+        self.table.setColumnWidth(2, max(300, self.table.columnWidth(2)))
+        self.table.setColumnWidth(3, max(400, self.table.columnWidth(3)))
         matched = sum(row.source is not None for row in self.rows)
         self.info.setText(
             f"A Folder：{len(self.source_info.folders)} | B Folder：{len(self.template_info.folders)} | "
-            f"当前匹配：{matched} | B 顺序固定 | A 候选按 Geometry 过滤"
+            f"当前匹配：{matched} | B 顺序固定 | A 下拉仅显示同 Geometry"
         )
 
     def apply_sync(self) -> None:
