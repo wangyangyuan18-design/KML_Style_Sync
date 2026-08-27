@@ -32,8 +32,11 @@ jobs:
       - name: Validate Python sources
         shell: pwsh
         run: |
-          python -m compileall -q main.py kml_style_sync
+          python -m compileall -q main.py kml_style_sync tests
           if ($LASTEXITCODE -ne 0) { throw "Python source validation failed." }
+
+      - name: Run regression tests
+        run: python -m unittest discover -s tests -v
 
       - name: Build one-file Windows EXE
         run: python -m PyInstaller --clean --noconfirm --onefile --windowed --name KML_Style_Synchronizer main.py
