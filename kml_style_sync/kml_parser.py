@@ -75,7 +75,9 @@ def _inline_key(style: etree._Element) -> str:
     return "inline:" + etree.tostring(style, method="c14n").decode("utf-8")
 
 
-def _style_usage(root: etree._Element, placemarks: list[etree._Element]) -> tuple[dict[str, int], str | None, str | None]:
+def _style_usage(
+    root: etree._Element, placemarks: list[etree._Element]
+) -> tuple[dict[str, int], str | None, str | None]:
     styles = _style_table(root)
     usage: Counter[str] = Counter()
     for pm in placemarks:
@@ -99,21 +101,19 @@ def _style_usage(root: etree._Element, placemarks: list[etree._Element]) -> tupl
 
 
 def _folder_name(folder: etree._Element, index: int) -> str:
-    value = folder.findtext(f"{{{KML_NS}}}name")
-    value = (value or "").strip()
+    value = (folder.findtext(f"{{{KML_NS}}}name") or "").strip()
     return value or f"(未命名 Folder {index})"
 
 
-def _scan_folder(root: etree._Element, folder: etree._Element, path: tuple[str, ...], index: int) -> FolderInfo:
-    name = _folder_name(folder, index)
-    folder_path = path + (name,)
-    # Deliberately use direct Placemarks only. A parent Folder must not inherit
-    # the geometry/style of nested Folders, otherwise parent rows become MIXED
-    # merely because different child folders contain different geometries.
+def _build_folder_info(
+    root: etree._Element,
+    folder: etree._Element,
+    folder_path: tuple[str, ...],
+) -> FolderInfo:
     placemarks = folder.xpath("./kml:Placemark", namespaces=NS)
     usage, standard, standard_xml = _style_usage(root, placemarks)
     info = FolderInfo(
-        name=name,
+        name=folder_path[-1],
         folder_path=folder_path,
         geometry_type=_geometry_type(placemarks),
         feature_count=len(placemarks),
@@ -123,9 +123,26 @@ def _scan_folder(root: etree._Element, folder: etree._Element, path: tuple[str, 
     )
     log.debug(
         "FOLDER: path=%s geometry=%s placemarks=%d standard=%s",
-        info.display_path, info.geometry_type, info.feature_count, info.standard_style_key,
+        info.display_path,
+        info.geometry_type,
+        info.feature_count,
+        info.standard_style_key,
     )
     return info
+
+
+def _walk_folders(
+    root: etree._Element,
+    parent: etree._Element,
+    parent_path: tuple[str, ...],
+    result: list[FolderInfo],
+) -> None:
+    folders = parent.xpath("./kml:Folder", namespaces=NS)
+    for index, folder in enumerate(folders, 1):
+        name = _folder_name(folder, index)
+        path = parent_path + (name,)
+        result.append(_build_folder_info(root, folder, path))
+        _walk_folders(root, folder, path, result)
 
 
 def analyze_file(path: Path) -> KMLFileInfo:
@@ -134,13 +151,14 @@ def analyze_file(path: Path) -> KMLFileInfo:
         raise ValueError("请选择一个 .kml 或 .kmz 文件。")
     log.info("ANALYZE FILE START: %s", path)
     root = load_tree(path)
-    folders = root.xpath(".//kml:Folder", namespaces=NS)
     result: list[FolderInfo] = []
-    for i, folder in enumerate(folders, 1):
-        # Build the full ancestor Folder path so duplicate child names remain distinct.
-        ancestors = folder.xpath("ancestor::kml:Folder", namespaces=NS)
-        parent_names = tuple(_folder_name(parent, j + 1) for j, parent in enumerate(ancestors))
-        result.append(_scan_folder(root, folder, parent_names, i))
+    # Start only at top-level Folders. Nested Folders are discovered recursively.
+    roots = root.xpath(".//kml:Folder[not(ancestor::kml:Folder)]", namespaces=NS)
+    for index, folder in enumerate(roots, 1):
+        name = _folder_name(folder, index)
+        path_tuple = (name,)
+        result.append(_build_folder_info(root, folder, path_tuple))
+        _walk_folders(root, folder, path_tuple, result)
     log.info("ANALYZE FILE COMPLETE: folders=%d", len(result))
     return KMLFileInfo(file_path=path, folders=result)
 
