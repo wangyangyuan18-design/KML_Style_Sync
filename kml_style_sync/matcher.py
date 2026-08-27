@@ -9,40 +9,31 @@ def _path_key(folder: FolderInfo) -> tuple[str, ...]:
 
 
 def build_match_rows(source_folders: list[FolderInfo], template_folders: list[FolderInfo]) -> list[MatchRow]:
-    """Match A Folders to B template Folders without making metadata editable.
+    """Create one row for every A Folder.
 
-    Matching priority:
-      1. exact normalized full Folder path + same geometry;
-      2. unique normalized Folder name + same geometry.
-    Ambiguous or geometry-incompatible matches are left unmatched.
+    B is the authoritative template catalogue. Automatic matching is only a
+    convenience: exact full-path match first, then unique Folder-name match.
+    Geometry must be identical. The UI always lets the user override the
+    automatic choice with a geometry-filtered B Folder combo box.
     """
     rows: list[MatchRow] = []
-    used_templates: set[int] = set()
     for source in source_folders:
         exact = [
-            (i, template)
-            for i, template in enumerate(template_folders)
-            if i not in used_templates
-            and _path_key(template) == _path_key(source)
+            template for template in template_folders
+            if _path_key(template) == _path_key(source)
             and template.geometry_type == source.geometry_type
         ]
         if len(exact) == 1:
-            i, template = exact[0]
-            used_templates.add(i)
-            rows.append(MatchRow(source=source, template=template, status="MATCHED"))
+            rows.append(MatchRow(source=source, template=exact[0], status="MATCHED"))
             continue
 
         by_name = [
-            (i, template)
-            for i, template in enumerate(template_folders)
-            if i not in used_templates
-            and normalize_name(template.name) == normalize_name(source.name)
+            template for template in template_folders
+            if normalize_name(template.name) == normalize_name(source.name)
             and template.geometry_type == source.geometry_type
         ]
         if len(by_name) == 1:
-            i, template = by_name[0]
-            used_templates.add(i)
-            rows.append(MatchRow(source=source, template=template, status="MATCHED"))
+            rows.append(MatchRow(source=source, template=by_name[0], status="MATCHED"))
         elif len(by_name) > 1:
             rows.append(MatchRow(source=source, status="AMBIGUOUS"))
         else:
@@ -51,7 +42,7 @@ def build_match_rows(source_folders: list[FolderInfo], template_folders: list[Fo
 
 
 def candidates_for(source: FolderInfo, template_folders: list[FolderInfo]) -> list[FolderInfo]:
-    """Return compatible B Folders; kept for API compatibility, not used by the UI."""
+    """All B Folder choices allowed for this A Folder: same Geometry only."""
     return [
         folder for folder in template_folders
         if folder.geometry_type == source.geometry_type
