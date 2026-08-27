@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import copy
 import logging
-import shutil
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
+
 from lxml import etree
 
 from .logger import get_logger
@@ -38,11 +38,11 @@ def _style_signature(style: etree._Element) -> bytes:
 
 
 def _collect_styles(root: etree._Element) -> dict[str, etree._Element]:
-    return {el.get("id"): el for el in root.xpath(".//k:Style[@id]", namespaces=NSMAP)}
+    return {el.get("id"): el for el in root.xpath(".//k:Style[@id]", namespaces=NSMAP) if el.get("id")}
 
 
 def _collect_stylemaps(root: etree._Element) -> dict[str, etree._Element]:
-    return {el.get("id"): el for el in root.xpath(".//k:StyleMap[@id]", namespaces=NSMAP)}
+    return {el.get("id"): el for el in root.xpath(".//k:StyleMap[@id]", namespaces=NSMAP) if el.get("id")}
 
 
 def _resolve_style(root: etree._Element, style_url: str | None, visited: set[str] | None = None) -> etree._Element | None:
@@ -81,12 +81,6 @@ def _resolve_pm_style(root: etree._Element, pm: etree._Element) -> etree._Elemen
     return _resolve_style(root, urls[0]) if urls else None
 
 
-def _geometry_type(pm: etree._Element) -> str:
-    flags = {"POINT": bool(pm.xpath(".//k:Point", namespaces=NSMAP)), "LINE": bool(pm.xpath(".//k:LineString", namespaces=NSMAP)), "POLYGON": bool(pm.xpath(".//k:Polygon", namespaces=NSMAP))}
-    kinds = [k for k, present in flags.items() if present]
-    return kinds[0] if len(kinds) == 1 else ("MIXED" if kinds else "UNKNOWN")
-
-
 def _replace_style(pm: etree._Element, style: etree._Element) -> None:
     for child in list(pm):
         if child.tag in (q("Style"), q("styleUrl")):
@@ -97,17 +91,15 @@ def _replace_style(pm: etree._Element, style: etree._Element) -> None:
 
 
 def _read_kml(path: Path) -> tuple[bytes, str | None]:
-    log.debug("READ SOURCE: %s", path)
     if path.suffix.lower() == ".kml":
         return path.read_bytes(), None
     with zipfile.ZipFile(path, "r") as zf:
         names = zf.namelist()
-        kml = next((n for n in names if n.lower().endswith(".kml") and Path(n).name.lower() == "doc.kml"), None)
-        kml = kml or next((n for n in names if n.lower().endswith(".kml")), None)
-        if not kml:
+        kml_name = next((n for n in names if Path(n).name.lower() == "doc.kml"), None)
+        kml_name = kml_name or next((n for n in names if n.lower().endswith(".kml")), None)
+        if not kml_name:
             raise ValueError(f"KMZ does not contain a KML file: {path}")
-        log.debug("KMZ payload: %s; members=%d", kml, len(names))
-        return zf.read(kml), kml
+        return zf.read(kml_name), kml_name
 
 
 def _parse(data: bytes, label: str) -> etree._Element:
@@ -119,81 +111,106 @@ def _serialize(root: etree._Element) -> bytes:
     return etree.tostring(root, xml_declaration=True, encoding="UTF-8", pretty_print=True)
 
 
-def _copy_tree(source: Path, output: Path) -> None:
-    log.info("COPY PROJECT: %s -> %s", source, output)
-    shutil.copytree(source, output)
+def _folder_name(folder: etree._Element, index: int) -> str:
+    name = (folder.findtext(q("name")) or "").strip()
+    return name or f"(未命名 Folder {index})"
 
 
-def sync_project(source: Path, template: Path, output: Path, mappings: dict[Path, Path]) -> SyncResult:
-    log.info("SYNC START source=%s template=%s output=%s mappings=%d", source, template, output, len(mappings))
-    if output.exists():
-        raise FileExistsError(f"Output already exists: {output}")
-    _copy_tree(source, output)
+def _folder_index(root: etree._Element) -> dict[tuple[str, ...], etree._Element]:
+    """Build the same Folder path model used by the parser."""
+    result: dict[tuple[str, ...], etree._Element] = {}
+
+    def walk(parent: etree._Element, parent_path: tuple[str, ...]) -> None:
+        folders = parent.xpath("./k:Folder", namespaces=NSMAP)
+        for i, folder in enumerate(folders, 1):
+            name = _folder_name(folder, i)
+            path = parent_path + (name,)
+            result[path] = folder
+            walk(folder, path)
+
+    # Document may be nested below kml; start from all top-level Folder elements
+    # whose parent is not itself a Folder.
+    roots = root.xpath(".//k:Folder[not(ancestor::k:Folder)]", namespaces=NSMAP)
+    for i, folder in enumerate(roots, 1):
+        name = _folder_name(folder, i)
+        path = (name,)
+        result[path] = folder
+        walk(folder, path)
+    return result
+
+
+def _apply_to_folder(root: etree._Element, folder_path: tuple[str, ...], standard: etree._Element) -> int:
+    folders = _folder_index(root)
+    folder = folders.get(folder_path)
+    if folder is None:
+        log.warning("SOURCE FOLDER NOT FOUND: %s", " / ".join(folder_path))
+        return 0
+    changed = 0
+    # Only direct Placemarks belong to this Folder row. Nested Folder styles are
+    # intentionally left untouched and are handled by their own mapping rows.
+    for pm in folder.xpath("./k:Placemark", namespaces=NSMAP):
+        _replace_style(pm, standard)
+        changed += 1
+    return changed
+
+
+def sync_file(source: Path, template: Path, output: Path, mappings: dict[tuple[str, ...], tuple[str, ...]]) -> SyncResult:
+    """Synchronize styles from B Folders into matching A Folders in one file."""
+    source = Path(source)
+    template = Path(template)
+    output = Path(output)
+    log.info("SYNC START A=%s B=%s OUTPUT=%s MAPPINGS=%d", source, template, output, len(mappings))
+    if source.resolve() == output.resolve():
+        raise ValueError("输出文件不能覆盖 A 原始工程文件，请选择新的输出文件。")
+    if template.suffix.lower() != source.suffix.lower():
+        raise ValueError("A 工程与输出文件的扩展名必须保持一致（KML 对 KML，KMZ 对 KMZ）。")
+
+    src_data, src_kml_name = _read_kml(source)
+    tpl_data, _ = _read_kml(template)
+    src_root = _parse(src_data, str(source))
+    tpl_root = _parse(tpl_data, str(template))
+
+    template_folders = _folder_index(tpl_root)
     warnings: list[str] = []
     changed = 0
     styles_changed = 0
 
-    for index, (source_rel, template_rel) in enumerate(mappings.items(), 1):
-        log.info("MAPPING %d/%d: A=%s <- B=%s", index, len(mappings), source_rel, template_rel)
-        src = source / source_rel
-        tpl = template / template_rel
-        if not src.exists() or not tpl.exists():
-            message = f"Missing mapping: {source_rel} <- {template_rel}"
-            log.error(message)
+    for source_path, template_path in mappings.items():
+        log.info("MAPPING A=%s <- B=%s", " / ".join(source_path), " / ".join(template_path))
+        template_folder = template_folders.get(template_path)
+        if template_folder is None:
+            message = f"B Folder 不存在：{' / '.join(template_path)}"
             warnings.append(message)
+            log.error(message)
             continue
-        try:
-            src_data, src_kml_name = _read_kml(src)
-            tpl_data, _ = _read_kml(tpl)
-            src_root = _parse(src_data, str(src))
-            tpl_root = _parse(tpl_data, str(tpl))
-            template_pms = tpl_root.xpath(".//k:Placemark", namespaces=NSMAP)
-            source_pms = src_root.xpath(".//k:Placemark", namespaces=NSMAP)
-            log.info("PLACEMARKS A=%d B=%d", len(source_pms), len(template_pms))
-            if not template_pms:
-                warnings.append(f"No Placemark in template: {template_rel}")
+        template_pms = template_folder.xpath("./k:Placemark", namespaces=NSMAP)
+        counts: dict[bytes, int] = {}
+        style_by_sig: dict[bytes, etree._Element] = {}
+        for pm in template_pms:
+            style = _resolve_pm_style(tpl_root, pm)
+            if style is None:
                 continue
+            sig = _style_signature(style)
+            counts[sig] = counts.get(sig, 0) + 1
+            style_by_sig[sig] = style
+        if not counts:
+            message = f"B Folder 没有可用 Style：{' / '.join(template_path)}"
+            warnings.append(message)
+            log.warning(message)
+            continue
+        standard = style_by_sig[max(counts, key=counts.get)]
+        file_changed = _apply_to_folder(src_root, source_path, standard)
+        changed += file_changed
+        styles_changed += file_changed
+        log.info("STYLE APPLIED folder=%s placemarks=%d", " / ".join(source_path), file_changed)
 
-            counts: dict[bytes, int] = {}
-            style_by_sig: dict[bytes, etree._Element] = {}
-            for pm in template_pms:
-                style = _resolve_pm_style(tpl_root, pm)
-                if style is None:
-                    continue
-                sig = _style_signature(style)
-                counts[sig] = counts.get(sig, 0) + 1
-                style_by_sig[sig] = style
-            if not counts:
-                message = f"No usable Style/StyleMap in template: {template_rel}"
-                log.error(message)
-                warnings.append(message)
-                continue
-            standard = style_by_sig[max(counts, key=counts.get)]
-            log.info("STANDARD STYLE selected usage=%d/%d", max(counts.values()), len(template_pms))
-
-            target_type = _geometry_type(template_pms[0])
-            file_changed = 0
-            for pm in source_pms:
-                if _geometry_type(pm) != target_type:
-                    continue
-                _replace_style(pm, standard)
-                file_changed += 1
-            changed += file_changed
-            styles_changed += file_changed
-            log.info("STYLE APPLIED: %d Placemark(s), geometry=%s", file_changed, target_type)
-
-            dst = output / source_rel
-            if src.suffix.lower() == ".kml":
-                dst.write_bytes(_serialize(src_root))
-            else:
-                with zipfile.ZipFile(src, "r") as zin, zipfile.ZipFile(dst, "w") as zout:
-                    for item in zin.infolist():
-                        data = _serialize(src_root) if item.filename == src_kml_name else zin.read(item.filename)
-                        zout.writestr(item, data)
-                log.info("KMZ WRITTEN: %s", dst)
-        except Exception:
-            log.exception("MAPPING FAILED: A=%s <- B=%s", source_rel, template_rel)
-            raise
-
-    log.info("SYNC COMPLETE changed=%d styles=%d warnings=%d", changed, styles_changed, len(warnings))
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if source.suffix.lower() == ".kml":
+        output.write_bytes(_serialize(src_root))
+    else:
+        with zipfile.ZipFile(source, "r") as zin, zipfile.ZipFile(output, "w") as zout:
+            for item in zin.infolist():
+                data = _serialize(src_root) if item.filename == src_kml_name else zin.read(item.filename)
+                zout.writestr(item, data)
+    log.info("SYNC COMPLETE changed=%d warnings=%d output=%s", changed, len(warnings), output)
     return SyncResult(output, changed, styles_changed, warnings)
