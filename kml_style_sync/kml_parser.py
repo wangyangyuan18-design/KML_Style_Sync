@@ -6,9 +6,11 @@ from pathlib import Path
 from lxml import etree
 
 from .models import GeometryType, LayerInfo
+from .logger import get_logger
 
 KML_NS = "http://www.opengis.net/kml/2.2"
 NS = {"kml": KML_NS}
+log = get_logger()
 
 
 def normalize_name(value: str) -> str:
@@ -16,8 +18,11 @@ def normalize_name(value: str) -> str:
 
 
 def _read_kml_bytes(path: Path) -> bytes:
+    log.debug("READ: %s", path)
     if path.suffix.lower() == ".kml":
-        return path.read_bytes()
+        data = path.read_bytes()
+        log.debug("READ KML bytes=%d", len(data))
+        return data
     if path.suffix.lower() == ".kmz":
         with zipfile.ZipFile(path) as archive:
             names = archive.namelist()
@@ -25,7 +30,9 @@ def _read_kml_bytes(path: Path) -> bytes:
             candidate = candidate or next((n for n in names if n.lower().endswith(".kml")), None)
             if candidate is None:
                 raise ValueError(f"No KML found in {path}")
-            return archive.read(candidate)
+            data = archive.read(candidate)
+            log.debug("READ KMZ KML=%s bytes=%d members=%d", candidate, len(data), len(names))
+            return data
     raise ValueError(f"Unsupported file: {path}")
 
 
@@ -51,10 +58,12 @@ def _inline_key(style: etree._Element) -> str:
 
 
 def analyze_file(path: Path, relative_root: Path | None = None) -> LayerInfo:
+    log.info("ANALYZE START: %s", path)
     root = etree.fromstring(_read_kml_bytes(path))
     styles = _style_table(root)
     usage: Counter[str] = Counter()
-    for placemark in root.xpath(".//kml:Placemark", namespaces=NS):
+    placemarks = root.xpath(".//kml:Placemark", namespaces=NS)
+    for placemark in placemarks:
         inline = placemark.find(f"{{{KML_NS}}}Style")
         style_url = placemark.findtext(f"{{{KML_NS}}}styleUrl")
         if inline is not None:
@@ -71,17 +80,29 @@ def analyze_file(path: Path, relative_root: Path | None = None) -> LayerInfo:
     stem = path.stem.strip()
     parent_name = path.parent.name.strip()
     name = parent_name if relative_root and path.parent != relative_root and parent_name else stem
+    geometry = _geometry_type(root)
+    log.info("ANALYZE OK: name=%s geometry=%s placemarks=%d styles=%d standard=%s", name, geometry, len(placemarks), len(styles), standard)
 
     return LayerInfo(name=name, file_path=path, relative_path=relative,
-                     geometry_type=_geometry_type(root), feature_count=sum(usage.values()),
+                     geometry_type=geometry, feature_count=len(placemarks),
                      style_usage=dict(usage), standard_style_key=standard,
                      standard_style_xml=standard_xml)
 
 
 def scan_project(root: Path) -> list[LayerInfo]:
     root = Path(root)
+    log.info("SCAN START: %s", root)
     files = [p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in {".kml", ".kmz"}]
-    return [analyze_file(path, root) for path in files]
+    log.info("SCAN FOUND: %d KML/KMZ files", len(files))
+    result: list[LayerInfo] = []
+    for path in files:
+        try:
+            result.append(analyze_file(path, root))
+        except Exception:
+            log.exception("ANALYZE FAILED: %s", path)
+            raise
+    log.info("SCAN COMPLETE: %d layers", len(result))
+    return result
 
 
 def load_tree(path: Path) -> etree._Element:
