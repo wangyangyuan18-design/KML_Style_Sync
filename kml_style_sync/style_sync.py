@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 import copy
-import re
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from tempfile import TemporaryDirectory
 from lxml import etree
 
 NS = "http://www.opengis.net/kml/2.2"
@@ -25,7 +23,7 @@ class SyncResult:
 
 
 def _local_id(value: str | None) -> str:
-    return (value or "").strip().lstrip("#")
+    return (value or "").strip().lstrip("#").split("/")[-1]
 
 
 def _style_signature(style: etree._Element) -> bytes:
@@ -35,133 +33,148 @@ def _style_signature(style: etree._Element) -> bytes:
 
 
 def _collect_styles(root: etree._Element) -> dict[str, etree._Element]:
-    return {
-        el.get("id"): el
-        for el in root.xpath(".//k:Style[@id]", namespaces=NSMAP)
-    }
+    return {el.get("id"): el for el in root.xpath(".//k:Style[@id]", namespaces=NSMAP)}
 
 
 def _collect_stylemaps(root: etree._Element) -> dict[str, etree._Element]:
-    return {
-        el.get("id"): el
-        for el in root.xpath(".//k:StyleMap[@id]", namespaces=NSMAP)
-    }
+    return {el.get("id"): el for el in root.xpath(".//k:StyleMap[@id]", namespaces=NSMAP)}
 
 
-def _style_from_url(root: etree._Element, style_url: str | None) -> etree._Element | None:
+def _resolve_style(root: etree._Element, style_url: str | None, visited: set[str] | None = None) -> etree._Element | None:
     sid = _local_id(style_url)
     if not sid:
         return None
+    visited = visited or set()
+    if sid in visited:
+        return None
+    visited.add(sid)
     styles = _collect_styles(root)
-    direct = styles.get(sid)
-    if direct is not None:
-        return direct
-    maps = _collect_stylemaps(root)
-    sm = maps.get(sid)
+    if sid in styles:
+        return styles[sid]
+    sm = _collect_stylemaps(root).get(sid)
     if sm is None:
         return None
-    # Normal Google Earth rendering uses normalKey first; fall back to highlightedKey.
-    pairs = sm.xpath("./k:Pair", namespaces=NSMAP)
-    preferred = None
-    for pair in pairs:
+    fallback: str | None = None
+    for pair in sm.xpath("./k:Pair", namespaces=NSMAP):
         key = pair.find(q("key"))
         url = pair.find(q("styleUrl"))
-        if key is not None and url is not None:
-            if (key.text or "").strip() == "normalKey":
-                preferred = url.text
-                break
-            preferred = preferred or url.text
-    return _style_from_url(root, preferred)
+        if url is None or not (url.text or "").strip():
+            continue
+        if key is not None and (key.text or "").strip() == "normalKey":
+            return _resolve_style(root, url.text, visited)
+        fallback = fallback or url.text
+    return _resolve_style(root, fallback, visited) if fallback else None
 
 
-def _replace_inline_style(placemark: etree._Element, standard_style: etree._Element) -> None:
-    for child in list(placemark):
-        if child.tag == q("Style"):
-            placemark.remove(child)
-    style = copy.deepcopy(standard_style)
-    style.attrib.pop("id", None)
-    # Inline style is self-contained and avoids cross-document style ID collisions.
-    placemark.insert(0, style)
-
-
-def _resolve_standard_style(template_root: etree._Element, placemark: etree._Element) -> etree._Element | None:
-    inline = placemark.find(q("Style"))
+def _resolve_pm_style(root: etree._Element, pm: etree._Element) -> etree._Element | None:
+    inline = pm.find(q("Style"))
     if inline is not None:
         return inline
-    urls = placemark.xpath("./k:styleUrl/text()", namespaces=NSMAP)
-    if urls:
-        return _style_from_url(template_root, urls[0])
-    return None
+    urls = pm.xpath("./k:styleUrl/text()", namespaces=NSMAP)
+    return _resolve_style(root, urls[0]) if urls else None
 
 
-def _find_output_kml(path: Path) -> str:
+def _geometry_type(pm: etree._Element) -> str:
+    flags = {
+        "POINT": bool(pm.xpath(".//k:Point", namespaces=NSMAP)),
+        "LINE": bool(pm.xpath(".//k:LineString", namespaces=NSMAP)),
+        "POLYGON": bool(pm.xpath(".//k:Polygon", namespaces=NSMAP)),
+    }
+    kinds = [k for k, present in flags.items() if present]
+    return kinds[0] if len(kinds) == 1 else ("MIXED" if kinds else "UNKNOWN")
+
+
+def _replace_style(pm: etree._Element, style: etree._Element) -> None:
+    for child in list(pm):
+        if child.tag in (q("Style"), q("styleUrl")):
+            pm.remove(child)
+    clone = copy.deepcopy(style)
+    clone.attrib.pop("id", None)
+    pm.insert(0, clone)
+
+
+def _read_kml(path: Path) -> tuple[bytes, str | None]:
     if path.suffix.lower() == ".kml":
-        return path.read_text(encoding="utf-8")
+        return path.read_bytes(), None
     with zipfile.ZipFile(path, "r") as zf:
-        names = zf.namelist()
-        candidates = [n for n in names if n.lower().endswith(".kml")]
-        if not candidates:
+        kml = next((n for n in zf.namelist() if n.lower().endswith(".kml") and Path(n).name.lower() == "doc.kml"), None)
+        kml = kml or next((n for n in zf.namelist() if n.lower().endswith(".kml")), None)
+        if not kml:
             raise ValueError(f"KMZ does not contain a KML file: {path}")
-        return zf.read(candidates[0]).decode("utf-8")
+        return zf.read(kml), kml
 
 
-def _parse_xml(text: str) -> etree._Element:
-    parser = etree.XMLParser(remove_blank_text=False, recover=False)
-    return etree.fromstring(text.encode("utf-8"), parser)
+def _parse(data: bytes) -> etree._Element:
+    return etree.fromstring(data, etree.XMLParser(remove_blank_text=False, recover=False))
 
 
-def _write_kml(root: etree._Element) -> bytes:
+def _serialize(root: etree._Element) -> bytes:
     return etree.tostring(root, xml_declaration=True, encoding="UTF-8", pretty_print=True)
 
 
-def sync_kml_or_kmz(source: Path, template: Path, output: Path) -> SyncResult:
-    """Synchronize the template's standard styles into a copied source document.
+def _copy_tree(source: Path, output: Path) -> None:
+    import shutil
+    if output.exists():
+        raise FileExistsError(f"Output already exists: {output}")
+    shutil.copytree(source, output)
 
-    The source geometry and metadata remain untouched. Styles are embedded per
-    Placemark to avoid cross-document Style/StyleMap ID collisions.
-    For KMZ, every archive member other than the KML payload is copied byte-for-byte.
+
+def sync_project(source: Path, template: Path, output: Path, mappings: dict[Path, Path]) -> SyncResult:
+    """Apply each B template layer's standard style only to its mapped A layer.
+
+    mappings: A-relative KML/KMZ path -> B-relative KML/KMZ path.
+    Source geometry, names, descriptions, folders and non-KML KMZ resources are preserved.
     """
-    source_text = _find_output_kml(source)
-    template_text = _find_output_kml(template)
-    source_root = _parse_xml(source_text)
-    template_root = _parse_xml(template_text)
-
-    template_placemarks = template_root.xpath(".//k:Placemark", namespaces=NSMAP)
-    source_placemarks = source_root.xpath(".//k:Placemark", namespaces=NSMAP)
-    if not template_placemarks or not source_placemarks:
-        raise ValueError("Source/template contains no Placemark elements")
-
-    # Build a safe fallback standard style from the most frequently referenced
-    # template style, while preserving explicit styles for individual template layers.
-    style_counts: dict[bytes, int] = {}
-    style_by_sig: dict[bytes, etree._Element] = {}
-    for pm in template_placemarks:
-        style = _resolve_standard_style(template_root, pm)
-        if style is not None:
-            sig = _style_signature(style)
-            style_counts[sig] = style_counts.get(sig, 0) + 1
-            style_by_sig[sig] = style
-    if not style_counts:
-        raise ValueError("Template contains no usable Style or StyleMap references")
-    standard_style = style_by_sig[max(style_counts, key=style_counts.get)]
-
+    if output.exists():
+        raise FileExistsError(f"Output already exists: {output}")
+    _copy_tree(source, output)
+    warnings: list[str] = []
     changed = 0
-    for pm in source_placemarks:
-        _replace_inline_style(pm, standard_style)
-        changed += 1
 
-    output.parent.mkdir(parents=True, exist_ok=True)
-    if output.suffix.lower() == ".kml":
-        output.write_bytes(_write_kml(source_root))
-    elif output.suffix.lower() == ".kmz":
-        with zipfile.ZipFile(source, "r") as zin, zipfile.ZipFile(output, "w") as zout:
-            kml_name = next((n for n in zin.namelist() if n.lower().endswith(".kml")), None)
-            if not kml_name:
-                raise ValueError("Source KMZ has no KML payload")
-            for item in zin.infolist():
-                data = _write_kml(source_root) if item.filename == kml_name else zin.read(item.filename)
-                zout.writestr(item, data)
-    else:
-        raise ValueError("Output must end in .kml or .kmz")
+    for source_rel, template_rel in mappings.items():
+        src = source / source_rel
+        tpl = template / template_rel
+        if not src.exists() or not tpl.exists():
+            warnings.append(f"Missing mapping: {source_rel} <- {template_rel}")
+            continue
+        src_data, src_kml_name = _read_kml(src)
+        tpl_data, _ = _read_kml(tpl)
+        src_root = _parse(src_data)
+        tpl_root = _parse(tpl_data)
+        template_pms = tpl_root.xpath(".//k:Placemark", namespaces=NSMAP)
+        if not template_pms:
+            warnings.append(f"No Placemark in template: {template_rel}")
+            continue
 
-    return SyncResult(output, changed, changed, [])
+        # Select the most frequently used effective style in this B layer.
+        counts: dict[bytes, int] = {}
+        style_by_sig: dict[bytes, etree._Element] = {}
+        for pm in template_pms:
+            style = _resolve_pm_style(tpl_root, pm)
+            if style is None:
+                continue
+            sig = _style_signature(style)
+            counts[sig] = counts.get(sig, 0) + 1
+            style_by_sig[sig] = style
+        if not counts:
+            warnings.append(f"No usable Style/StyleMap in template: {template_rel}")
+            continue
+        standard = style_by_sig[max(counts, key=counts.get)]
+
+        target_type = _geometry_type(template_pms[0])
+        for pm in src_root.xpath(".//k:Placemark", namespaces=NSMAP):
+            if _geometry_type(pm) != target_type:
+                continue
+            _replace_style(pm, standard)
+            changed += 1
+
+        dst = output / source_rel
+        if src.suffix.lower() == ".kml":
+            dst.write_bytes(_serialize(src_root))
+        else:
+            with zipfile.ZipFile(src, "r") as zin, zipfile.ZipFile(dst, "w") as zout:
+                for item in zin.infolist():
+                    data = _serialize(src_root) if item.filename == src_kml_name else zin.read(item.filename)
+                    zout.writestr(item, data)
+
+    return SyncResult(output, changed, changed, warnings)
