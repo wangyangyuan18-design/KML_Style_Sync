@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import copy
-import io
 import zipfile
 from collections import Counter
 from pathlib import Path
@@ -14,8 +12,7 @@ NS = {"kml": KML_NS}
 
 
 def normalize_name(value: str) -> str:
-    value = Path(value).stem.strip().lower()
-    return " ".join(value.split())
+    return " ".join(Path(value).stem.strip().lower().split())
 
 
 def _read_kml_bytes(path: Path) -> bytes:
@@ -25,8 +22,7 @@ def _read_kml_bytes(path: Path) -> bytes:
         with zipfile.ZipFile(path) as archive:
             names = archive.namelist()
             candidate = next((n for n in names if n.lower() == "doc.kml"), None)
-            if candidate is None:
-                candidate = next((n for n in names if n.lower().endswith(".kml")), None)
+            candidate = candidate or next((n for n in names if n.lower().endswith(".kml")), None)
             if candidate is None:
                 raise ValueError(f"No KML found in {path}")
             return archive.read(candidate)
@@ -34,26 +30,19 @@ def _read_kml_bytes(path: Path) -> bytes:
 
 
 def _geometry_type(root: etree._Element) -> GeometryType:
-    found: set[str] = set()
-    mapping = {"Point": "POINT", "LineString": "LINE", "Polygon": "POLYGON"}
-    for local, kind in mapping.items():
-        if root.xpath(f".//kml:{local}", namespaces=NS):
-            found.add(kind)
+    found = {kind for local, kind in {"Point":"POINT", "LineString":"LINE", "Polygon":"POLYGON"}.items()
+             if root.xpath(f".//kml:{local}", namespaces=NS)}
     if len(found) == 1:
-        return found.pop()  # type: ignore[return-value]
-    if len(found) > 1:
-        return "MIXED"
-    return "UNKNOWN"
+        return next(iter(found))  # type: ignore[return-value]
+    return "MIXED" if found else "UNKNOWN"
 
 
 def _style_table(root: etree._Element) -> dict[str, etree._Element]:
-    table: dict[str, etree._Element] = {}
-    for style in root.xpath(".//kml:Style[@id]", namespaces=NS):
-        table[f"#{style.get('id')}"] = style
+    table = {f"#{style.get('id')}": style for style in root.xpath(".//kml:Style[@id]", namespaces=NS)}
     for style_map in root.xpath(".//kml:StyleMap[@id]", namespaces=NS):
-        pairs = style_map.xpath("./kml:Pair[kml:key='normal']/kml:styleUrl/text()", namespaces=NS)
-        if pairs and pairs[0] in table:
-            table[f"#{style_map.get('id')}"] = table[pairs[0]]
+        refs = style_map.xpath("./kml:Pair[kml:key='normal']/kml:styleUrl/text()", namespaces=NS)
+        if refs and refs[0] in table:
+            table[f"#{style_map.get('id')}"] = table[refs[0]]
     return table
 
 
@@ -75,32 +64,18 @@ def analyze_file(path: Path, relative_root: Path | None = None) -> LayerInfo:
         else:
             usage["<unstyled>"] += 1
 
-    count = sum(usage.values())
     standard = max(usage, key=usage.get) if usage else None
-    standard_xml = None
-    if standard and standard.startswith("inline:"):
-        standard_xml = standard[len("inline:"):]
-    elif standard in styles:
-        standard_xml = etree.tostring(styles[standard], encoding="unicode")
-
+    standard_xml = (standard[len("inline:"):] if standard and standard.startswith("inline:")
+                    else etree.tostring(styles[standard], encoding="unicode") if standard in styles else None)
     relative = path.relative_to(relative_root) if relative_root else Path(path.name)
-    parent_name = path.parent.name.strip()
     stem = path.stem.strip()
-    # Folder name is preferred when it is a meaningful layer container; otherwise file stem.
-    name = parent_name if parent_name and parent_name != relative_root.name if relative_root else stem
-    if not name:
-        name = stem
+    parent_name = path.parent.name.strip()
+    name = parent_name if relative_root and path.parent != relative_root and parent_name else stem
 
-    return LayerInfo(
-        name=name,
-        file_path=path,
-        relative_path=relative,
-        geometry_type=_geometry_type(root),
-        feature_count=count,
-        style_usage=dict(usage),
-        standard_style_key=standard,
-        standard_style_xml=standard_xml,
-    )
+    return LayerInfo(name=name, file_path=path, relative_path=relative,
+                     geometry_type=_geometry_type(root), feature_count=sum(usage.values()),
+                     style_usage=dict(usage), standard_style_key=standard,
+                     standard_style_xml=standard_xml)
 
 
 def scan_project(root: Path) -> list[LayerInfo]:
