@@ -58,8 +58,8 @@ class MainWindow(QMainWindow):
         layout.addLayout(top)
 
         hint = QLabel(
-            "B 是标准库：先完整解析 B 文件中的全部 Folder、Geometry 与标准 Style；"
-            "表格严格按 B Folder 原始顺序建立。A 仅负责选择对应 Folder；候选 A 只允许与 B 具有相同 Geometry。"
+            "B 是标准库：先解析 B 文件中的全部有效图层、Geometry 与标准 Style；"
+            "表格严格按 B 的有效图层原始顺序建立。A 仅负责选择对应 Folder；候选 A 只允许与 B 具有相同 Geometry。"
         )
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -82,8 +82,8 @@ class MainWindow(QMainWindow):
 
         bottom = QHBoxLayout()
         self.info = QLabel("请先选择 A 工程文件和 B 标准文件")
-        refresh_btn = QPushButton("按名称重新匹配")
-        refresh_btn.clicked.connect(self.refresh_matches)
+        refresh_btn = QPushButton("按名称重新匹配未匹配项")
+        refresh_btn.clicked.connect(self.refresh_unmatched)
         apply_btn = QPushButton("执行 Style 同步")
         apply_btn.clicked.connect(self.apply_sync)
         bottom.addWidget(self.info, 1)
@@ -113,7 +113,7 @@ class MainWindow(QMainWindow):
             return
         self.source_label.setText(f"A 工程文件：{path}")
         self.source_label.setToolTip(str(path))
-        self.refresh_matches()
+        self._rebuild_matches(preserve_current=False)
 
     def _load_template(self, path: Path) -> None:
         try:
@@ -123,7 +123,7 @@ class MainWindow(QMainWindow):
             return
         self.template_label.setText(f"B 标准文件：{path}")
         self.template_label.setToolTip(str(path))
-        self.refresh_matches()
+        self._rebuild_matches(preserve_current=False)
 
     @staticmethod
     def _readonly_item(text: str, tooltip: str | None = None) -> QTableWidgetItem:
@@ -166,17 +166,19 @@ class MainWindow(QMainWindow):
         row = self.rows[row_index]
         selected = combo.currentData()
         row.source = selected
-        if selected is None:
-            row.status = "UNMATCHED"
-            geometry_a = "—"
-            status = "— 未匹配"
-        else:
-            row.status = "MANUAL_MATCHED"
-            geometry_a = selected.geometry_type
-            status = "✓ 手动匹配"
-        self.table.setItem(row_index, 4, self._readonly_item(geometry_a))
-        self.table.setItem(row_index, 5, self._readonly_item(status))
+        row.status = "UNMATCHED" if selected is None else "MANUAL_MATCHED"
+        self._update_row_cells(row_index, row)
         self._refresh_duplicate_statuses()
+        self._update_summary()
+
+    def _update_row_cells(self, row_index: int, row: MatchRow) -> None:
+        source = row.source
+        self.table.setItem(row_index, 4, self._readonly_item(source.geometry_type if source else "—"))
+        if source is None:
+            status = "⚠ 名称重复，需手动选择" if row.status == "AMBIGUOUS" else "— 未匹配"
+        else:
+            status = "✓ 自动匹配" if row.status == "AUTO_MATCHED" else "✓ 手动匹配"
+        self.table.setItem(row_index, 5, self._readonly_item(status))
 
     def _refresh_duplicate_statuses(self) -> None:
         """Show duplicate A assignments without changing the user's choices."""
@@ -185,42 +187,63 @@ class MainWindow(QMainWindow):
             if row.source is not None:
                 by_source[row.source.folder_path].append(index)
 
-        for indices in by_source.values():
-            if len(indices) <= 1:
+        for index, row in enumerate(self.rows):
+            if row.source is None:
                 continue
-            for index in indices:
+            if len(by_source[row.source.folder_path]) > 1:
                 self.table.setItem(index, 5, self._readonly_item("⚠ A Folder 重复使用"))
+            else:
+                self._update_row_cells(index, row)
 
-    def refresh_matches(self) -> None:
+    def _update_summary(self) -> None:
+        if self.source_info is None or self.template_info is None:
+            self.info.setText("请先选择 A 工程文件和 B 标准文件")
+            return
+        a_total = len(self.source_info.folders)
+        b_total = len(self.template_info.folders)
+        auto_count = sum(row.source is not None and row.status == "AUTO_MATCHED" for row in self.rows)
+        manual_count = sum(row.source is not None and row.status == "MANUAL_MATCHED" for row in self.rows)
+
+        assigned: dict[tuple[str, ...], int] = defaultdict(int)
+        for row in self.rows:
+            if row.source is not None:
+                assigned[row.source.folder_path] += 1
+        unique_assigned = {path for path, count in assigned.items() if count == 1}
+        unmatched = a_total - len(unique_assigned)
+
+        self.info.setText(
+            f"A 有效图层：{a_total} | B 有效图层：{b_total} | "
+            f"自动匹配：{auto_count} | 手动匹配：{manual_count} | A 未匹配：{unmatched}"
+        )
+
+    def _rebuild_matches(self, preserve_current: bool) -> None:
         if self.source_info is None or self.template_info is None:
             self.table.setRowCount(0)
             self._combo_boxes.clear()
+            self._update_summary()
             return
 
+        current_by_b = {row.template.folder_path: row for row in self.rows} if preserve_current else {}
         self.rows = build_match_rows(self.source_info.folders, self.template_info.folders)
         self.table.setRowCount(len(self.rows))
         self._combo_boxes = []
         self._building_table = True
         try:
             for i, row in enumerate(self.rows):
+                if preserve_current and row.template.folder_path in current_by_b:
+                    previous = current_by_b[row.template.folder_path]
+                    row.source = previous.source
+                    row.status = previous.status
+
                 template = row.template
                 source = row.source
-
                 self.table.setItem(i, 0, self._readonly_item(template.display_path, template.display_path))
                 self.table.setItem(i, 1, self._readonly_item(template.geometry_type))
                 self.table.setItem(i, 2, self._readonly_item(self._style_text(template), template.standard_style_xml))
-
                 combo = self._make_a_combo(i, template, source)
                 self.table.setCellWidget(i, 3, combo)
                 self._combo_boxes.append(combo)
-
-                if source is None:
-                    self.table.setItem(i, 4, self._readonly_item("—"))
-                    status = "⚠ 名称重复，需手动选择" if row.status == "AMBIGUOUS" else "— 未匹配"
-                else:
-                    self.table.setItem(i, 4, self._readonly_item(source.geometry_type))
-                    status = "✓ 自动匹配"
-                self.table.setItem(i, 5, self._readonly_item(status))
+                self._update_row_cells(i, row)
         finally:
             self._building_table = False
 
@@ -229,11 +252,13 @@ class MainWindow(QMainWindow):
         self.table.setColumnWidth(0, max(300, self.table.columnWidth(0)))
         self.table.setColumnWidth(2, max(300, self.table.columnWidth(2)))
         self.table.setColumnWidth(3, max(400, self.table.columnWidth(3)))
-        matched = sum(row.source is not None for row in self.rows)
-        self.info.setText(
-            f"A Folder：{len(self.source_info.folders)} | B Folder：{len(self.template_info.folders)} | "
-            f"当前匹配：{matched} | B 顺序固定 | A 下拉仅显示同 Geometry"
-        )
+        self._update_summary()
+
+    def refresh_unmatched(self) -> None:
+        if self.source_info is None or self.template_info is None:
+            self._update_summary()
+            return
+        self._rebuild_matches(preserve_current=True)
 
     def apply_sync(self) -> None:
         if self.source_info is None or self.template_info is None:
