@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import posixpath
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import unquote
 
 from lxml import etree
 
@@ -44,7 +47,13 @@ def _collect_stylemaps(root: etree._Element) -> dict[str, etree._Element]:
     return {el.get("id"): el for el in root.xpath(".//k:StyleMap[@id]", namespaces=NSMAP) if el.get("id")}
 
 
-def _resolve_style(root: etree._Element, style_url: str | None, visited: set[str] | None = None) -> etree._Element | None:
+def _resolve_style(
+    root: etree._Element,
+    style_url: str | None,
+    styles: dict[str, etree._Element],
+    style_maps: dict[str, etree._Element],
+    visited: set[str] | None = None,
+) -> etree._Element | None:
     sid = _local_id(style_url)
     if not sid:
         return None
@@ -53,10 +62,9 @@ def _resolve_style(root: etree._Element, style_url: str | None, visited: set[str
         log.warning("STYLE CYCLE: %s", sid)
         return None
     visited.add(sid)
-    styles = _collect_styles(root)
     if sid in styles:
         return styles[sid]
-    sm = _collect_stylemaps(root).get(sid)
+    sm = style_maps.get(sid)
     if sm is None:
         log.warning("STYLE NOT FOUND: %s", sid)
         return None
@@ -67,17 +75,22 @@ def _resolve_style(root: etree._Element, style_url: str | None, visited: set[str
         if url is None or not (url.text or "").strip():
             continue
         if key is not None and (key.text or "").strip() in {"normalKey", "normal"}:
-            return _resolve_style(root, url.text, visited)
+            return _resolve_style(root, url.text, styles, style_maps, visited)
         fallback = fallback or url.text
-    return _resolve_style(root, fallback, visited) if fallback else None
+    return _resolve_style(root, fallback, styles, style_maps, visited) if fallback else None
 
 
-def _resolve_pm_style(root: etree._Element, pm: etree._Element) -> etree._Element | None:
+def _resolve_pm_style(
+    root: etree._Element,
+    pm: etree._Element,
+    styles: dict[str, etree._Element],
+    style_maps: dict[str, etree._Element],
+) -> etree._Element | None:
     inline = pm.find(q("Style"))
     if inline is not None:
         return inline
     urls = pm.xpath("./k:styleUrl/text()", namespaces=NSMAP)
-    return _resolve_style(root, urls[0]) if urls else None
+    return _resolve_style(root, urls[0], styles, style_maps) if urls else None
 
 
 def _replace_style(pm: etree._Element, style: etree._Element) -> None:
@@ -133,12 +146,18 @@ def _folder_index(root: etree._Element) -> dict[tuple[str, ...], etree._Element]
     return result
 
 
-def _standard_style_for_folder(root: etree._Element, folder: etree._Element, label: str) -> tuple[etree._Element | None, str | None]:
+def _standard_style_for_folder(
+    root: etree._Element,
+    folder: etree._Element,
+    label: str,
+    styles: dict[str, etree._Element],
+    style_maps: dict[str, etree._Element],
+) -> tuple[etree._Element | None, str | None]:
     placemarks = folder.xpath("./k:Placemark", namespaces=NSMAP)
     counts: dict[bytes, int] = {}
     style_by_sig: dict[bytes, etree._Element] = {}
     for pm in placemarks:
-        style = _resolve_pm_style(root, pm)
+        style = _resolve_pm_style(root, pm, styles, style_maps)
         if style is None:
             continue
         sig = _style_signature(style)
@@ -165,6 +184,55 @@ def _apply_to_folder(root: etree._Element, folder_path: tuple[str, ...], standar
     return changed
 
 
+def _prepare_style_for_kmz(
+    style: etree._Element,
+    template_path: Path,
+    template_archive: zipfile.ZipFile | None,
+    asset_payloads: dict[str, bytes],
+    asset_map: dict[str, str],
+    warnings: list[str],
+) -> etree._Element:
+    clone = copy.deepcopy(style)
+    for href in clone.xpath(".//k:href", namespaces=NSMAP):
+        original = unquote((href.text or "").strip())
+        if not original or original.startswith(("http://", "https://", "data:")):
+            continue
+        normalized = posixpath.normpath(original.replace("\\", "/")).lstrip("/")
+        while normalized.startswith("../"):
+            normalized = normalized[3:]
+        if normalized in asset_map:
+            href.text = asset_map[normalized]
+            continue
+
+        data: bytes | None = None
+        if template_archive is not None:
+            names = {name.replace("\\", "/").lstrip("/"): name for name in template_archive.namelist()}
+            member = names.get(normalized) or names.get("files/" + normalized)
+            if member:
+                try:
+                    data = template_archive.read(member)
+                except Exception as exc:
+                    warnings.append(f"读取 Style 资源失败：{original} ({exc})")
+        else:
+            candidate = (template_path.parent / normalized).resolve()
+            try:
+                candidate.relative_to(template_path.parent.resolve())
+                if candidate.is_file():
+                    data = candidate.read_bytes()
+            except ValueError:
+                pass
+
+        if data is None:
+            warnings.append(f"未找到 Style 资源：{original}")
+            continue
+        digest = hashlib.sha256(data).hexdigest()[:12]
+        destination = f"kml_style_sync_assets/{digest}_{Path(normalized).name or 'asset.bin'}"
+        asset_payloads[destination] = data
+        asset_map[normalized] = destination
+        href.text = destination
+    return clone
+
+
 def sync_file(source: Path, template: Path, output: Path, mappings: dict[tuple[str, ...], tuple[str, ...]]) -> SyncResult:
     source = Path(source)
     template = Path(template)
@@ -179,32 +247,69 @@ def sync_file(source: Path, template: Path, output: Path, mappings: dict[tuple[s
     tpl_data, _ = _read_kml(template)
     src_root = _parse(src_data, str(source))
     tpl_root = _parse(tpl_data, str(template))
+    template_styles = _collect_styles(tpl_root)
+    template_stylemaps = _collect_stylemaps(tpl_root)
     template_folders = _folder_index(tpl_root)
+    source_folders = _folder_index(src_root)
     warnings: list[str] = []
     changed = 0
+    changed_styles = 0
+    template_archive: zipfile.ZipFile | None = None
+    asset_payloads: dict[str, bytes] = {}
+    asset_map: dict[str, str] = {}
 
-    for source_path, template_path in mappings.items():
-        label = " / ".join(template_path)
-        log.info("MAPPING A=%s <- B=%s", " / ".join(source_path), label)
-        template_folder = template_folders.get(template_path)
-        if template_folder is None:
-            warnings.append(f"B Folder 不存在：{label}")
-            continue
-        standard, error = _standard_style_for_folder(tpl_root, template_folder, label)
-        if error:
-            warnings.append(error)
-            continue
-        assert standard is not None
-        file_changed = _apply_to_folder(src_root, source_path, standard)
-        changed += file_changed
-        log.info("STYLE APPLIED folder=%s placemarks=%d", " / ".join(source_path), file_changed)
+    try:
+        if template.suffix.lower() == ".kmz":
+            template_archive = zipfile.ZipFile(template, "r")
 
-    output.parent.mkdir(parents=True, exist_ok=True)
-    if source.suffix.lower() == ".kml":
-        output.write_bytes(_serialize(src_root))
-    else:
-        with zipfile.ZipFile(source, "r") as zin, zipfile.ZipFile(output, "w") as zout:
-            for item in zin.infolist():
-                data = _serialize(src_root) if item.filename == src_kml_name else zin.read(item.filename)
-                zout.writestr(item, data)
-    return SyncResult(output, changed, changed, warnings)
+        for source_path, template_path_value in mappings.items():
+            label = " / ".join(template_path_value)
+            log.info("MAPPING A=%s <- B=%s", " / ".join(source_path), label)
+            template_folder = template_folders.get(template_path_value)
+            if template_folder is None:
+                warnings.append(f"B Folder 不存在：{label}")
+                continue
+            standard, error = _standard_style_for_folder(
+                tpl_root, template_folder, label, template_styles, template_stylemaps
+            )
+            if error:
+                warnings.append(error)
+                continue
+            assert standard is not None
+
+            if output.suffix.lower() == ".kmz":
+                standard_for_output = _prepare_style_for_kmz(
+                    standard, template, template_archive, asset_payloads, asset_map, warnings
+                )
+                source_folder = source_folders.get(source_path)
+                if source_folder is None:
+                    warnings.append(f"A Folder 不存在：{' / '.join(source_path)}")
+                    continue
+                file_changed = 0
+                for pm in source_folder.xpath("./k:Placemark", namespaces=NSMAP):
+                    _replace_style(pm, standard_for_output)
+                    file_changed += 1
+            else:
+                standard_for_output = copy.deepcopy(standard)
+                file_changed = _apply_to_folder(src_root, source_path, standard_for_output)
+
+            changed += file_changed
+            changed_styles += 1 if file_changed else 0
+            log.info("STYLE APPLIED folder=%s placemarks=%d", " / ".join(source_path), file_changed)
+
+        output.parent.mkdir(parents=True, exist_ok=True)
+        if source.suffix.lower() == ".kml":
+            output.write_bytes(_serialize(src_root))
+        else:
+            with zipfile.ZipFile(source, "r") as zin, zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+                for item in zin.infolist():
+                    data = _serialize(src_root) if item.filename == src_kml_name else zin.read(item.filename)
+                    zout.writestr(item, data)
+                for asset_name, data in asset_payloads.items():
+                    if asset_name not in zin.namelist():
+                        zout.writestr(asset_name, data)
+    finally:
+        if template_archive is not None:
+            template_archive.close()
+
+    return SyncResult(output, changed, changed_styles, warnings)
