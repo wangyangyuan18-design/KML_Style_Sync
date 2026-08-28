@@ -48,10 +48,23 @@ class ParserMatcherTests(unittest.TestCase):
             a = analyze_file(source).folders
             b = analyze_file(template).folders
             rows = build_match_rows(a, b)
-            self.assertEqual(len(rows), len(b))
-            self.assertEqual(rows[0].source, None)  # B1 Line has no same-name A
-            self.assertEqual(rows[1].source.name, "B2 Point")
-            self.assertEqual([f.name for f in candidates_for(b[0], a)], ["Other Line"])
+            # A-centric: one row per effective A layer, not one row per B layer.
+            self.assertEqual(len(rows), len(a))
+            self.assertEqual(rows[0].source.name, "B2 Point")
+            self.assertEqual(rows[0].template.name, "B2 Point")
+            self.assertIsNone(rows[1].template)  # Other Line has no same-name B
+            self.assertEqual([f.name for f in candidates_for(a[1], b)], ["B1 Line"])
+
+    def test_name_match_rejects_wrong_geometry(self):
+        a = [
+            # Same name as B1 Line, but wrong Geometry: must remain unmatched.
+            type("Layer", (), {"name": "B1 Line", "folder_path": ("B1 Line",), "geometry_type": "POINT"})(),
+        ]
+        b = [
+            type("Layer", (), {"name": "B1 Line", "folder_path": ("B1 Line",), "geometry_type": "LINE"})(),
+        ]
+        rows = build_match_rows(a, b)
+        self.assertIsNone(rows[0].template)
 
 
 if __name__ == "__main__":
