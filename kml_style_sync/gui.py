@@ -26,12 +26,16 @@ from .style_sync import sync_file
 
 
 class MainWindow(QMainWindow):
-    """Standalone B-centric KML/KMZ style synchronization UI."""
+    """A-centric KML/KMZ style synchronization UI.
+
+    A is the task list: every effective A layer is always shown.
+    B is an independent, read-only standard-style library.
+    """
 
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("KML Style Sync - Standalone")
-        self.resize(1500, 820)
+        self.resize(1520, 920)
         self.source_info: KMLFileInfo | None = None
         self.template_info: KMLFileInfo | None = None
         self.rows: list[MatchRow] = []
@@ -58,19 +62,42 @@ class MainWindow(QMainWindow):
         layout.addLayout(top)
 
         hint = QLabel(
-            "B 是标准库：先解析 B 文件中的全部有效图层、Geometry 与标准 Style；"
-            "表格严格按 B 的有效图层原始顺序建立。A 仅负责选择对应 Folder；候选 A 只允许与 B 具有相同 Geometry。"
+            "A 是待同步任务清单：所有 A 有效图层固定显示；B 是只读标准 Style 库。"
+            "自动匹配仅使用“Folder 名称 + Geometry”精确匹配；人工下拉只能选择相同 Geometry 的 B 有效图层。"
         )
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
+        library_title = QLabel("B 标准 Style 库（只读）")
+        library_title.setStyleSheet("font-weight: bold;")
+        layout.addWidget(library_title)
+
+        self.library_table = QTableWidget(0, 4)
+        self.library_table.setHorizontalHeaderLabels([
+            "B 标准 Folder",
+            "Geometry",
+            "标准 Style",
+            "Style 使用率",
+        ])
+        self.library_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.library_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.library_table.setAlternatingRowColors(True)
+        self.library_table.setWordWrap(False)
+        self.library_table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.library_table.setMaximumHeight(260)
+        layout.addWidget(self.library_table)
+
+        task_title = QLabel("A 工程 Style 同步任务")
+        task_title.setStyleSheet("font-weight: bold;")
+        layout.addWidget(task_title)
+
         self.table = QTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels([
-            "B 标准 Folder",
+            "A 工程 Folder",
+            "Geometry A",
+            "B 标准 Folder（可选择）",
             "Geometry B",
             "标准 Style",
-            "A 工程 Folder（可选择）",
-            "Geometry A",
             "匹配状态",
         ])
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -80,9 +107,14 @@ class MainWindow(QMainWindow):
         self.table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         layout.addWidget(self.table, 1)
 
+        self.unmatched_label = QLabel("A 未匹配图层：—")
+        self.unmatched_label.setWordWrap(True)
+        self.unmatched_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(self.unmatched_label)
+
         bottom = QHBoxLayout()
         self.info = QLabel("请先选择 A 工程文件和 B 标准文件")
-        refresh_btn = QPushButton("按名称重新匹配未匹配项")
+        refresh_btn = QPushButton("仅匹配未匹配项")
         refresh_btn.clicked.connect(self.refresh_unmatched)
         apply_btn = QPushButton("执行 Style 同步")
         apply_btn.clicked.connect(self.apply_sync)
@@ -144,114 +176,134 @@ class MainWindow(QMainWindow):
             return f"内联 Style ({folder.standard_style_ratio * 100:.1f}%)"
         return f"{key} ({folder.standard_style_ratio * 100:.1f}%)"
 
-    def _make_a_combo(self, row_index: int, template: FolderInfo, selected: FolderInfo | None) -> QComboBox:
+    def _populate_library(self) -> None:
+        self.library_table.setRowCount(0)
+        if self.template_info is None:
+            return
+        self.library_table.setRowCount(len(self.template_info.folders))
+        for i, folder in enumerate(self.template_info.folders):
+            self.library_table.setItem(i, 0, self._readonly_item(folder.display_path, folder.display_path))
+            self.library_table.setItem(i, 1, self._readonly_item(folder.geometry_type))
+            self.library_table.setItem(i, 2, self._readonly_item(self._style_text(folder), folder.standard_style_xml))
+            ratio = f"{folder.standard_style_ratio * 100:.1f}%" if folder.standard_style_key not in {None, "<unstyled>"} else "—"
+            self.library_table.setItem(i, 3, self._readonly_item(ratio))
+        self.library_table.resizeColumnsToContents()
+        self.library_table.setColumnWidth(0, max(360, self.library_table.columnWidth(0)))
+        self.library_table.setColumnWidth(2, max(360, self.library_table.columnWidth(2)))
+
+    def _make_b_combo(self, row_index: int, source: FolderInfo, selected: FolderInfo | None) -> QComboBox:
         combo = QComboBox()
-        combo.setMinimumWidth(380)
-        combo.addItem("— 不同步此 B Folder —", None)
-        for source in candidates_for(template, self.source_info.folders if self.source_info else []):
-            combo.addItem(source.display_path, source)
+        combo.setMinimumWidth(420)
+        combo.addItem("— 未匹配：选择 B 标准 Folder —", None)
+        for template in candidates_for(source, self.template_info.folders if self.template_info else []):
+            combo.addItem(template.display_path, template)
         if selected is not None:
             for idx in range(combo.count()):
                 if combo.itemData(idx) is selected:
                     combo.setCurrentIndex(idx)
                     break
         combo.currentIndexChanged.connect(
-            lambda _index, r=row_index, cb=combo: self._on_source_changed(r, cb)
+            lambda _index, r=row_index, cb=combo: self._on_template_changed(r, cb)
         )
         return combo
 
-    def _on_source_changed(self, row_index: int, combo: QComboBox) -> None:
+    def _on_template_changed(self, row_index: int, combo: QComboBox) -> None:
         if self._building_table or row_index >= len(self.rows):
             return
         row = self.rows[row_index]
-        selected = combo.currentData()
-        row.source = selected
-        row.status = "UNMATCHED" if selected is None else "MANUAL_MATCHED"
+        row.template = combo.currentData()
+        row.status = "UNMATCHED" if row.template is None else "MANUAL_MATCHED"
         self._update_row_cells(row_index, row)
-        self._refresh_duplicate_statuses()
         self._update_summary()
 
     def _update_row_cells(self, row_index: int, row: MatchRow) -> None:
-        source = row.source
-        self.table.setItem(row_index, 4, self._readonly_item(source.geometry_type if source else "—"))
-        if source is None:
-            status = "⚠ 名称重复，需手动选择" if row.status == "AMBIGUOUS" else "— 未匹配"
+        template = row.template
+        self.table.setItem(row_index, 3, self._readonly_item(template.geometry_type if template else "—"))
+        self.table.setItem(row_index, 4, self._readonly_item(self._style_text(template) if template else "—"))
+        if row.template is None:
+            if row.status == "AMBIGUOUS":
+                status = "⚠ 名称重复，需手动选择"
+            else:
+                status = "— 未匹配"
+        elif row.status == "AUTO_MATCHED":
+            status = "✓ 自动匹配"
         else:
-            status = "✓ 自动匹配" if row.status == "AUTO_MATCHED" else "✓ 手动匹配"
+            status = "✓ 手动匹配"
         self.table.setItem(row_index, 5, self._readonly_item(status))
 
     def _refresh_duplicate_statuses(self) -> None:
-        """Show duplicate A assignments without changing the user's choices."""
-        by_source: dict[tuple[str, ...], list[int]] = defaultdict(list)
-        for index, row in enumerate(self.rows):
-            if row.source is not None:
-                by_source[row.source.folder_path].append(index)
+        """Warn when one A Folder is assigned to multiple B rows.
 
-        for index, row in enumerate(self.rows):
-            if row.source is None:
-                continue
-            if len(by_source[row.source.folder_path]) > 1:
-                self.table.setItem(index, 5, self._readonly_item("⚠ A Folder 重复使用"))
-            else:
-                self._update_row_cells(index, row)
+        B standards may be reused by multiple A layers; the dangerous case is
+        one A layer being assigned to multiple B standards, which cannot happen
+        in this A-centric one-row-per-A model. This method is kept as a safety
+        hook for future model extensions.
+        """
+        # One row represents exactly one A effective layer, so duplicate A
+        # assignment across rows is structurally impossible in the A-centric UI.
+        return
 
     def _update_summary(self) -> None:
         if self.source_info is None or self.template_info is None:
             self.info.setText("请先选择 A 工程文件和 B 标准文件")
+            self.unmatched_label.setText("A 未匹配图层：—")
             return
+
         a_total = len(self.source_info.folders)
         b_total = len(self.template_info.folders)
-        auto_count = sum(row.source is not None and row.status == "AUTO_MATCHED" for row in self.rows)
-        manual_count = sum(row.source is not None and row.status == "MANUAL_MATCHED" for row in self.rows)
-
-        assigned: dict[tuple[str, ...], int] = defaultdict(int)
-        for row in self.rows:
-            if row.source is not None:
-                assigned[row.source.folder_path] += 1
-        unique_assigned = {path for path, count in assigned.items() if count == 1}
-        unmatched = a_total - len(unique_assigned)
+        auto_count = sum(row.template is not None and row.status == "AUTO_MATCHED" for row in self.rows)
+        manual_count = sum(row.template is not None and row.status == "MANUAL_MATCHED" for row in self.rows)
+        unmatched_rows = [row.source.display_path for row in self.rows if row.template is None]
+        unmatched_count = len(unmatched_rows)
 
         self.info.setText(
             f"A 有效图层：{a_total} | B 有效图层：{b_total} | "
-            f"自动匹配：{auto_count} | 手动匹配：{manual_count} | A 未匹配：{unmatched}"
+            f"自动匹配：{auto_count} | 手动匹配：{manual_count} | A 未匹配：{unmatched_count}"
         )
+        if unmatched_rows:
+            self.unmatched_label.setText("⚠ A 未匹配图层（{}）：{}".format(unmatched_count, "、".join(unmatched_rows)))
+        else:
+            self.unmatched_label.setText("✓ A 未匹配图层：0（全部 A 有效图层均已有匹配）")
 
     def _rebuild_matches(self, preserve_current: bool) -> None:
         if self.source_info is None or self.template_info is None:
             self.table.setRowCount(0)
             self._combo_boxes.clear()
+            self._populate_library()
             self._update_summary()
             return
 
-        current_by_b = {row.template.folder_path: row for row in self.rows} if preserve_current else {}
+        previous_by_a = {
+            row.source.folder_path: (row.template, row.status)
+            for row in self.rows
+        } if preserve_current else {}
+
         self.rows = build_match_rows(self.source_info.folders, self.template_info.folders)
+        if preserve_current:
+            for row in self.rows:
+                previous = previous_by_a.get(row.source.folder_path)
+                if previous is not None:
+                    row.template, row.status = previous
+
+        self._populate_library()
         self.table.setRowCount(len(self.rows))
         self._combo_boxes = []
         self._building_table = True
         try:
             for i, row in enumerate(self.rows):
-                if preserve_current and row.template.folder_path in current_by_b:
-                    previous = current_by_b[row.template.folder_path]
-                    row.source = previous.source
-                    row.status = previous.status
-
-                template = row.template
                 source = row.source
-                self.table.setItem(i, 0, self._readonly_item(template.display_path, template.display_path))
-                self.table.setItem(i, 1, self._readonly_item(template.geometry_type))
-                self.table.setItem(i, 2, self._readonly_item(self._style_text(template), template.standard_style_xml))
-                combo = self._make_a_combo(i, template, source)
-                self.table.setCellWidget(i, 3, combo)
+                self.table.setItem(i, 0, self._readonly_item(source.display_path, source.display_path))
+                self.table.setItem(i, 1, self._readonly_item(source.geometry_type))
+                combo = self._make_b_combo(i, source, row.template)
+                self.table.setCellWidget(i, 2, combo)
                 self._combo_boxes.append(combo)
                 self._update_row_cells(i, row)
         finally:
             self._building_table = False
 
-        self._refresh_duplicate_statuses()
         self.table.resizeColumnsToContents()
-        self.table.setColumnWidth(0, max(300, self.table.columnWidth(0)))
-        self.table.setColumnWidth(2, max(300, self.table.columnWidth(2)))
-        self.table.setColumnWidth(3, max(400, self.table.columnWidth(3)))
+        self.table.setColumnWidth(0, max(360, self.table.columnWidth(0)))
+        self.table.setColumnWidth(2, max(450, self.table.columnWidth(2)))
         self._update_summary()
 
     def refresh_unmatched(self) -> None:
@@ -265,41 +317,37 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "无法同步", "请先选择 A 工程文件和 B 标准文件。")
             return
 
-        duplicate_rows: dict[tuple[str, ...], list[str]] = defaultdict(list)
-        for row in self.rows:
-            if row.source is not None:
-                duplicate_rows[row.source.folder_path].append(row.template.display_path)
-        duplicates = {path: rows for path, rows in duplicate_rows.items() if len(rows) > 1}
-        if duplicates:
-            details = []
-            for path, b_rows in duplicates.items():
-                details.append(f"A：{' / '.join(path)}\nB：{'、'.join(b_rows)}")
+        unmatched = [row.source.display_path for row in self.rows if row.template is None]
+        if unmatched:
             QMessageBox.warning(
                 self,
-                "A Folder 重复匹配",
-                "同一个 A Folder 不能同时套用多个 B 标准 Style，请先修改：\n\n" + "\n\n".join(details),
+                "A 仍有未匹配图层",
+                "还有以下 A 有效图层未匹配 B 标准 Style，请先完成匹配：\n\n" + "\n".join(unmatched),
             )
             return
 
-        mappings: dict[tuple[str, ...], tuple[str, ...]] = {}
-        blocked: list[str] = []
-        for row in self.rows:
-            if row.source is None:
-                continue
-            if row.template.standard_style_ambiguous or row.template.standard_style_key in {None, "<unstyled>"}:
-                blocked.append(row.template.display_path)
-                continue
-            mappings[row.source.folder_path] = row.template.folder_path
-
-        if not mappings:
-            QMessageBox.warning(self, "无法同步", "没有可执行的 Folder 匹配关系。请检查 A 选择和 B Style。")
-            return
+        blocked = [
+            row.template.display_path
+            for row in self.rows
+            if row.template is not None
+            and (row.template.standard_style_ambiguous or row.template.standard_style_key in {None, "<unstyled>"})
+        ]
         if blocked:
             QMessageBox.warning(
                 self,
-                "存在需人工确认的 B Style",
-                "以下 B Folder 没有唯一标准 Style，因此不会同步：\n\n" + "\n".join(blocked),
+                "存在无有效标准 Style 的 B 图层",
+                "以下 B 标准 Folder 没有唯一可用 Style，无法安全同步：\n\n" + "\n".join(blocked),
             )
+            return
+
+        mappings: dict[tuple[str, ...], tuple[str, ...]] = {
+            row.source.folder_path: row.template.folder_path
+            for row in self.rows
+            if row.template is not None
+        }
+        if not mappings:
+            QMessageBox.warning(self, "无法同步", "没有可执行的 A→B 映射。")
+            return
 
         suffix = self.source_info.file_path.suffix.lower()
         default_name = f"{self.source_info.file_path.stem}_StyleSynced{suffix}"
@@ -323,7 +371,9 @@ class MainWindow(QMainWindow):
 
         msg = (
             "同步完成\n\n"
-            f"处理映射：{len(mappings)}\n"
+            f"A 有效图层：{len(self.source_info.folders)}\n"
+            f"自动匹配：{sum(row.status == 'AUTO_MATCHED' for row in self.rows)}\n"
+            f"手动匹配：{sum(row.status == 'MANUAL_MATCHED' for row in self.rows)}\n"
             f"修改 Placemark：{result.placemarks_changed}\n"
             f"同步 Style：{result.styles_changed}\n"
             f"输出：{result.output_path}"
