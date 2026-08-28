@@ -5,11 +5,12 @@ from pathlib import Path
 from typing import Literal
 
 GeometryType = Literal["POINT", "LINE", "POLYGON", "MIXED", "UNKNOWN"]
+MatchStatus = Literal["AUTO_MATCHED", "MANUAL_MATCHED", "UNMATCHED", "AMBIGUOUS"]
 
 
 @dataclass(slots=True)
 class FolderInfo:
-    """Metadata parsed from one KML Folder in document order."""
+    """Metadata for one KML Folder, preserving document order and hierarchy."""
 
     name: str
     folder_path: tuple[str, ...]
@@ -23,6 +24,15 @@ class FolderInfo:
     @property
     def display_path(self) -> str:
         return " / ".join(self.folder_path)
+
+    @property
+    def is_effective_layer(self) -> bool:
+        """True only when this Folder itself directly contains recognized geometry."""
+        return self.geometry_type in {"POINT", "LINE", "POLYGON"} and self.feature_count > 0
+
+    @property
+    def is_container(self) -> bool:
+        return not self.is_effective_layer
 
     @property
     def standard_style_ratio(self) -> float:
@@ -41,7 +51,7 @@ class FolderInfo:
 
 @dataclass(slots=True)
 class KMLFileInfo:
-    """One selected KML/KMZ file and all of its KML Folders."""
+    """One selected KML/KMZ file and all parsed effective Folders."""
 
     file_path: Path
     folders: list[FolderInfo] = field(default_factory=list)
@@ -49,8 +59,8 @@ class KMLFileInfo:
 
 @dataclass(slots=True)
 class MatchRow:
-    """One B-standard Folder row with an optional A-side match."""
+    """One B-standard effective-layer row with the current A assignment."""
 
     template: FolderInfo
     source: FolderInfo | None = None
-    status: str = "UNMATCHED"
+    status: MatchStatus = "UNMATCHED"
