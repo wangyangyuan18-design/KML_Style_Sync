@@ -74,7 +74,12 @@ def _local_style_id(value: str | None) -> str:
     return (value or "").strip().lstrip("#").split("/")[-1]
 
 
-def _resolve_style(root: etree._Element, style_url: str | None, visited: set[str] | None = None) -> etree._Element | None:
+def _resolve_style(
+    style_url: str | None,
+    styles: dict[str, etree._Element],
+    style_maps: dict[str, etree._Element],
+    visited: set[str] | None = None,
+) -> etree._Element | None:
     sid = _local_style_id(style_url)
     if not sid:
         return None
@@ -83,10 +88,10 @@ def _resolve_style(root: etree._Element, style_url: str | None, visited: set[str
         log.warning("STYLE CYCLE: %s", sid)
         return None
     visited.add(sid)
-    direct = _style_table(root).get(f"#{sid}")
+    direct = styles.get(f"#{sid}")
     if direct is not None:
         return direct
-    style_map = _style_maps(root).get(f"#{sid}")
+    style_map = style_maps.get(f"#{sid}")
     if style_map is None:
         return None
     fallback: str | None = None
@@ -96,29 +101,37 @@ def _resolve_style(root: etree._Element, style_url: str | None, visited: set[str
         if not url:
             continue
         if key in {"normalKey", "normal"}:
-            return _resolve_style(root, url, visited)
+            return _resolve_style(url, styles, style_maps, visited)
         fallback = fallback or url
-    return _resolve_style(root, fallback, visited) if fallback else None
+    return _resolve_style(fallback, styles, style_maps, visited) if fallback else None
 
 
 def _inline_key(style: etree._Element) -> str:
     return "inline:" + etree.tostring(style, method="c14n").decode("utf-8")
 
 
-def _effective_style_key(root: etree._Element, placemark: etree._Element) -> str:
+def _effective_style_key(
+    placemark: etree._Element,
+    styles: dict[str, etree._Element],
+    style_maps: dict[str, etree._Element],
+) -> str:
     inline = placemark.find(f"{{{KML_NS}}}Style")
     if inline is not None:
         return _inline_key(inline)
     url = placemark.findtext(f"{{{KML_NS}}}styleUrl")
-    style = _resolve_style(root, url)
+    style = _resolve_style(url, styles, style_maps)
     if style is None:
         return "<unstyled>"
     sid = style.get("id")
     return f"#{sid}" if sid else _inline_key(style)
 
 
-def _style_usage(root: etree._Element, placemarks: list[etree._Element]) -> tuple[dict[str, int], str | None, str | None, bool]:
-    usage: Counter[str] = Counter(_effective_style_key(root, pm) for pm in placemarks)
+def _style_usage(
+    placemarks: list[etree._Element],
+    styles: dict[str, etree._Element],
+    style_maps: dict[str, etree._Element],
+) -> tuple[dict[str, int], str | None, str | None, bool]:
+    usage: Counter[str] = Counter(_effective_style_key(pm, styles, style_maps) for pm in placemarks)
     usable = {key: count for key, count in usage.items() if key != "<unstyled>"}
     if not usable:
         return dict(usage), "<unstyled>", None, False
@@ -129,7 +142,7 @@ def _style_usage(root: etree._Element, placemarks: list[etree._Element]) -> tupl
     standard = winners[0]
     if standard.startswith("inline:"):
         return dict(usage), standard, standard[len("inline:"):], False
-    style = _style_table(root).get(standard)
+    style = styles.get(standard)
     xml = etree.tostring(style, encoding="unicode") if style is not None else None
     return dict(usage), standard, xml, False
 
@@ -139,13 +152,18 @@ def _folder_name(folder: etree._Element, index: int) -> str:
     return value or f"(未命名 Folder {index})"
 
 
-def _build_folder_info(root: etree._Element, folder: etree._Element, folder_path: tuple[str, ...]) -> FolderInfo:
-    # IMPORTANT: only direct Placemark children belong to this Folder's own
-    # effective geometry/style calculation. Child Folders are analyzed as
-    # independent FolderInfo objects and do not make the parent MIXED.
+def _build_folder_info(
+    folder: etree._Element,
+    folder_path: tuple[str, ...],
+    styles: dict[str, etree._Element] | None,
+    style_maps: dict[str, etree._Element] | None,
+) -> FolderInfo:
     placemarks = folder.xpath("./kml:Placemark", namespaces=NS)
     geometry = _geometry_type(placemarks)
-    usage, standard, standard_xml, ambiguous = _style_usage(root, placemarks)
+    if styles is None or style_maps is None:
+        usage, standard, standard_xml, ambiguous = {}, None, None, False
+    else:
+        usage, standard, standard_xml, ambiguous = _style_usage(placemarks, styles, style_maps)
     return FolderInfo(
         name=folder_path[-1],
         folder_path=folder_path,
@@ -159,56 +177,57 @@ def _build_folder_info(root: etree._Element, folder: etree._Element, folder_path
 
 
 def _walk_folders(
-    root: etree._Element,
     parent: etree._Element,
     parent_path: tuple[str, ...],
     result: list[FolderInfo],
+    styles: dict[str, etree._Element] | None,
+    style_maps: dict[str, etree._Element] | None,
 ) -> None:
     for index, folder in enumerate(parent.xpath("./kml:Folder", namespaces=NS), 1):
         name = _folder_name(folder, index)
         path = parent_path + (name,)
-        result.append(_build_folder_info(root, folder, path))
-        _walk_folders(root, folder, path, result)
+        result.append(_build_folder_info(folder, path, styles, style_maps))
+        _walk_folders(folder, path, result, styles, style_maps)
 
 
-def analyze_file(path: Path) -> KMLFileInfo:
+def analyze_file(path: Path, include_styles: bool = True) -> KMLFileInfo:
     path = Path(path)
     if path.suffix.lower() not in {".kml", ".kmz"}:
         raise ValueError("请选择一个 .kml 或 .kmz 文件。")
-    log.info("ANALYZE FILE START: %s", path)
+    log.info("ANALYZE FILE START: %s include_styles=%s", path, include_styles)
     root = load_tree(path)
+    styles = _style_table(root) if include_styles else None
+    style_maps = _style_maps(root) if include_styles else None
+
     parsed: list[FolderInfo] = []
     roots = root.xpath(".//kml:Folder[not(ancestor::kml:Folder)]", namespaces=NS)
     for index, folder in enumerate(roots, 1):
         name = _folder_name(folder, index)
         folder_path = (name,)
-        parsed.append(_build_folder_info(root, folder, folder_path))
-        _walk_folders(root, folder, folder_path, parsed)
+        parsed.append(_build_folder_info(folder, folder_path, styles, style_maps))
+        _walk_folders(folder, folder_path, parsed, styles, style_maps)
 
-    # Only folders that directly own recognized geometry are effective layers.
-    # Container Folders and truly empty Folders stay out of the matching model,
-    # while their names remain encoded in descendant display_path values.
     result = [folder for folder in parsed if folder.is_effective_layer]
 
-    if not result:
-        # A KML without any Folder is treated as one implicit layer, per the
-        # original requirement. A Folder-only document with no effective layer
-        # is intentionally reported as having zero effective layers instead.
-        if not roots:
-            placemarks = root.xpath(".//kml:Placemark", namespaces=NS)
-            usage, standard, standard_xml, ambiguous = _style_usage(root, placemarks)
-            implicit = FolderInfo(
-                name=path.stem,
-                folder_path=(path.stem,),
-                geometry_type=_geometry_type(placemarks),
-                feature_count=len(placemarks),
-                style_usage=usage,
-                standard_style_key=standard,
-                standard_style_xml=standard_xml,
-                standard_style_ambiguous=ambiguous,
-            )
-            if implicit.is_effective_layer:
-                result.append(implicit)
+    if not result and not roots:
+        placemarks = root.xpath(".//kml:Placemark", namespaces=NS)
+        geometry = _geometry_type(placemarks)
+        if include_styles and styles is not None and style_maps is not None:
+            usage, standard, standard_xml, ambiguous = _style_usage(placemarks, styles, style_maps)
+        else:
+            usage, standard, standard_xml, ambiguous = {}, None, None, False
+        implicit = FolderInfo(
+            name=path.stem,
+            folder_path=(path.stem,),
+            geometry_type=geometry,
+            feature_count=len(placemarks),
+            style_usage=usage,
+            standard_style_key=standard,
+            standard_style_xml=standard_xml,
+            standard_style_ambiguous=ambiguous,
+        )
+        if implicit.is_effective_layer:
+            result.append(implicit)
 
     log.info(
         "ANALYZE FILE COMPLETE: folders=%d effective_layers=%d containers_or_empty=%d",
@@ -220,7 +239,7 @@ def analyze_file(path: Path) -> KMLFileInfo:
 
 
 def scan_project(path: Path) -> list[FolderInfo]:
-    return analyze_file(Path(path)).folders
+    return analyze_file(Path(path), include_styles=False).folders
 
 
 def serialize_tree(root: etree._Element) -> bytes:
