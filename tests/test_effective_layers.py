@@ -44,13 +44,25 @@ class EffectiveLayerTests(unittest.TestCase):
         path.write_text(KML, encoding="utf-8")
         return path
 
-    def test_only_folders_with_direct_geometry_are_effective(self) -> None:
+    def test_effective_layers_are_folders_with_direct_geometry(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             info = analyze_file(self._write_kml(tmp))
             self.assertEqual(
                 [(f.display_path, f.geometry_type) for f in info.folders],
-                [("Container / 12C", "POINT"), ("Container / 24C", "LINE"), ("Direct", "POINT")],
+                [
+                    ("Container / 12C", "POINT"),
+                    ("Container / 24C", "LINE"),
+                    ("Direct", "POINT"),
+                    ("Direct / Child", "POINT"),
+                ],
             )
+
+    def test_empty_and_container_folders_are_not_effective(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            info = analyze_file(self._write_kml(tmp))
+            paths = {f.display_path for f in info.folders}
+            self.assertNotIn("Container", paths)
+            self.assertNotIn("Empty", paths)
 
     def test_parent_geometry_is_based_on_its_own_direct_placemarks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -58,6 +70,8 @@ class EffectiveLayerTests(unittest.TestCase):
             direct = next(f for f in info.folders if f.display_path == "Direct")
             self.assertEqual(direct.geometry_type, "POINT")
             self.assertEqual(direct.feature_count, 1)
+            child = next(f for f in info.folders if f.display_path == "Direct / Child")
+            self.assertEqual(child.geometry_type, "POINT")
 
     def test_matcher_does_not_use_geometry_alone(self) -> None:
         a = [
@@ -69,8 +83,11 @@ class EffectiveLayerTests(unittest.TestCase):
             FolderInfo("NEW", ("NEW",), "POINT", 1),
         ]
         rows = build_match_rows(a, b)
-        self.assertEqual(rows[0].source.name, "FDT")
-        self.assertIsNone(rows[1].source)
+        self.assertEqual(len(rows), len(a))
+        self.assertEqual(rows[0].source.name, "FAT")
+        self.assertIsNone(rows[0].template)
+        self.assertEqual(rows[1].source.name, "FDT")
+        self.assertEqual(rows[1].template.name, "FDT")
 
 
 if __name__ == "__main__":
