@@ -203,12 +203,7 @@ class MainWindow(QMainWindow):
         library_layout = QVBoxLayout(self.library_panel)
         library_layout.setContentsMargins(0, 0, 0, 0)
         self.library_table = QTableWidget(0, 4)
-        self.library_table.setHorizontalHeaderLabels([
-            "B 标准 Folder",
-            "Geometry",
-            "标准 Style",
-            "Style 使用率",
-        ])
+        self.library_table.setHorizontalHeaderLabels(["B 标准 Folder", "Geometry", "标准 Style", "Style 使用率"])
         self.library_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.library_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.library_table.setAlternatingRowColors(True)
@@ -231,12 +226,7 @@ class MainWindow(QMainWindow):
 
         self.table = QTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels([
-            "A 工程 Folder",
-            "Geometry A",
-            "B 标准 Folder（可选择）",
-            "Geometry B",
-            "标准 Style",
-            "匹配状态",
+            "A 工程 Folder", "Geometry A", "B 标准 Folder（可选择）", "Geometry B", "标准 Style", "匹配状态"
         ])
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -280,7 +270,6 @@ class MainWindow(QMainWindow):
         button = self.source_button if kind == "A" else self.template_file_button
         button.setEnabled(False)
         self.loading_label.setText(f"正在解析 {kind}：{path.name} …")
-
         thread = QThread(self)
         worker = AnalysisWorker(kind, path, include_styles)
         worker.moveToThread(thread)
@@ -296,9 +285,9 @@ class MainWindow(QMainWindow):
         thread.start()
 
     def _analysis_thread_finished(self, kind: str, thread: QThread) -> None:
-        thread.deleteLater()
         self._analysis_threads.pop(kind, None)
         self._analysis_workers.pop(kind, None)
+        thread.deleteLater()
         self.source_button.setEnabled(True)
         self.template_file_button.setEnabled(True)
         if not self._analysis_threads:
@@ -311,11 +300,13 @@ class MainWindow(QMainWindow):
             self.source_label.setText(f"A 工程文件：{info.file_path}")
             self.source_label.setToolTip(str(info.file_path))
         else:
+            active_saved = self.current_template_name is not None and template_path(self.current_template_name) == info.file_path
             self.template_info = info
-            self.current_template_name = None
-            self.template_label.setText(f"B：{info.file_path}")
+            if not active_saved:
+                self.current_template_name = None
+                self._set_template_combo_to_manual_file()
+            self.template_label.setText(f"B：{info.file_path}" + ("（收藏模板）" if active_saved else ""))
             self.template_label.setToolTip(str(info.file_path))
-            self._set_template_combo_to_manual_file()
         self._rebuild_matches(preserve_current=False)
 
     @Slot(str, str)
@@ -330,8 +321,8 @@ class MainWindow(QMainWindow):
 
     def _refresh_template_choices(self) -> None:
         names = [item["name"] for item in list_templates()]
-        self.template_combo.blockSignals(True)
         current = self.current_template_name
+        self.template_combo.blockSignals(True)
         self.template_combo.clear()
         self.template_combo.addItem("选择收藏模板…", None)
         for name in names:
@@ -432,9 +423,7 @@ class MainWindow(QMainWindow):
                 if combo.itemData(idx) is selected:
                     combo.setCurrentIndex(idx)
                     break
-        combo.currentIndexChanged.connect(
-            lambda _index, r=row_index, cb=combo: self._on_template_changed(r, cb)
-        )
+        combo.currentIndexChanged.connect(lambda _index, r=row_index, cb=combo: self._on_template_changed(r, cb))
         return combo
 
     def _on_template_changed(self, row_index: int, combo: QComboBox) -> None:
@@ -531,11 +520,7 @@ class MainWindow(QMainWindow):
 
         unmatched = [row.source.display_path for row in self.rows if row.template is None]
         if unmatched:
-            QMessageBox.warning(
-                self,
-                "A 仍有未匹配图层",
-                "还有以下 A 有效图层未匹配 B 标准 Style，请先完成匹配：\n\n" + "\n".join(unmatched),
-            )
+            QMessageBox.warning(self, "A 仍有未匹配图层", "还有以下 A 有效图层未匹配 B 标准 Style，请先完成匹配：\n\n" + "\n".join(unmatched))
             return
 
         blocked = [
@@ -545,11 +530,7 @@ class MainWindow(QMainWindow):
             and (row.template.standard_style_ambiguous or row.template.standard_style_key in {None, "<unstyled>"})
         ]
         if blocked:
-            QMessageBox.warning(
-                self,
-                "存在无有效标准 Style 的 B 图层",
-                "以下 B 标准 Folder 没有唯一可用 Style，无法安全同步：\n\n" + "\n".join(blocked),
-            )
+            QMessageBox.warning(self, "存在无有效标准 Style 的 B 图层", "以下 B 标准 Folder 没有唯一可用 Style，无法安全同步：\n\n" + "\n".join(blocked))
             return
 
         mappings: dict[tuple[str, ...], tuple[str, ...]] = {
@@ -563,12 +544,7 @@ class MainWindow(QMainWindow):
 
         suffix = self.source_info.file_path.suffix.lower()
         default_name = f"{self.source_info.file_path.stem}_StyleSynced{suffix}"
-        output, _ = QFileDialog.getSaveFileName(
-            self,
-            "保存同步后的 KML/KMZ 文件",
-            str(self.source_info.file_path.with_name(default_name)),
-            self._file_filter(),
-        )
+        output, _ = QFileDialog.getSaveFileName(self, "保存同步后的 KML/KMZ 文件", str(self.source_info.file_path.with_name(default_name)), self._file_filter())
         if not output:
             return
         output_path = Path(output)
@@ -587,6 +563,7 @@ class MainWindow(QMainWindow):
             f"自动匹配：{sum(row.status == 'AUTO_MATCHED' for row in self.rows)}\n"
             f"手动匹配：{sum(row.status == 'MANUAL_MATCHED' for row in self.rows)}\n"
             f"修改 Placemark：{result.placemarks_changed}\n"
+            f"同步 Style：{result.styles_changed}\n"
             f"输出：{result.output_path}"
         )
         if result.warnings:
