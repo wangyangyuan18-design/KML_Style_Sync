@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 import zipfile
 from collections import Counter
 from pathlib import Path
@@ -16,9 +15,7 @@ log = get_logger()
 
 
 def normalize_name(value: str) -> str:
-    text = value.strip()
-    text = re.sub(r"\.(?:kml|kmz)$", "", text, flags=re.IGNORECASE)
-    return " ".join(text.split()).casefold()
+    return " ".join(value.strip().lower().split())
 
 
 def _read_kml_bytes(path: Path) -> bytes:
@@ -74,10 +71,7 @@ def _style_maps(root: etree._Element) -> dict[str, etree._Element]:
 
 
 def _local_style_id(value: str | None) -> str:
-    text = (value or "").strip()
-    if "#" in text:
-        text = text.rsplit("#", 1)[1]
-    return text.lstrip("#").split("/")[-1]
+    return (value or "").strip().lstrip("#").split("/")[-1]
 
 
 def _resolve_style(root: etree._Element, style_url: str | None, visited: set[str] | None = None) -> etree._Element | None:
@@ -146,12 +140,16 @@ def _folder_name(folder: etree._Element, index: int) -> str:
 
 
 def _build_folder_info(root: etree._Element, folder: etree._Element, folder_path: tuple[str, ...]) -> FolderInfo:
+    # IMPORTANT: only direct Placemark children belong to this Folder's own
+    # effective geometry/style calculation. Child Folders are analyzed as
+    # independent FolderInfo objects and do not make the parent MIXED.
     placemarks = folder.xpath("./kml:Placemark", namespaces=NS)
+    geometry = _geometry_type(placemarks)
     usage, standard, standard_xml, ambiguous = _style_usage(root, placemarks)
     return FolderInfo(
         name=folder_path[-1],
         folder_path=folder_path,
-        geometry_type=_geometry_type(placemarks),
+        geometry_type=geometry,
         feature_count=len(placemarks),
         style_usage=usage,
         standard_style_key=standard,
@@ -160,7 +158,12 @@ def _build_folder_info(root: etree._Element, folder: etree._Element, folder_path
     )
 
 
-def _walk_folders(root: etree._Element, parent: etree._Element, parent_path: tuple[str, ...], result: list[FolderInfo]) -> None:
+def _walk_folders(
+    root: etree._Element,
+    parent: etree._Element,
+    parent_path: tuple[str, ...],
+    result: list[FolderInfo],
+) -> None:
     for index, folder in enumerate(parent.xpath("./kml:Folder", namespaces=NS), 1):
         name = _folder_name(folder, index)
         path = parent_path + (name,)
@@ -174,28 +177,45 @@ def analyze_file(path: Path) -> KMLFileInfo:
         raise ValueError("请选择一个 .kml 或 .kmz 文件。")
     log.info("ANALYZE FILE START: %s", path)
     root = load_tree(path)
-    result: list[FolderInfo] = []
+    parsed: list[FolderInfo] = []
     roots = root.xpath(".//kml:Folder[not(ancestor::kml:Folder)]", namespaces=NS)
     for index, folder in enumerate(roots, 1):
         name = _folder_name(folder, index)
         folder_path = (name,)
-        result.append(_build_folder_info(root, folder, folder_path))
-        _walk_folders(root, folder, folder_path, result)
+        parsed.append(_build_folder_info(root, folder, folder_path))
+        _walk_folders(root, folder, folder_path, parsed)
+
+    # Only folders that directly own recognized geometry are effective layers.
+    # Container Folders and truly empty Folders stay out of the matching model,
+    # while their names remain encoded in descendant display_path values.
+    result = [folder for folder in parsed if folder.is_effective_layer]
 
     if not result:
-        placemarks = root.xpath(".//kml:Placemark", namespaces=NS)
-        usage, standard, standard_xml, ambiguous = _style_usage(root, placemarks)
-        result.append(FolderInfo(
-            name=path.stem,
-            folder_path=(path.stem,),
-            geometry_type=_geometry_type(placemarks),
-            feature_count=len(placemarks),
-            style_usage=usage,
-            standard_style_key=standard,
-            standard_style_xml=standard_xml,
-            standard_style_ambiguous=ambiguous,
-        ))
-    log.info("ANALYZE FILE COMPLETE: folders=%d", len(result))
+        # A KML without any Folder is treated as one implicit layer, per the
+        # original requirement. A Folder-only document with no effective layer
+        # is intentionally reported as having zero effective layers instead.
+        if not roots:
+            placemarks = root.xpath(".//kml:Placemark", namespaces=NS)
+            usage, standard, standard_xml, ambiguous = _style_usage(root, placemarks)
+            implicit = FolderInfo(
+                name=path.stem,
+                folder_path=(path.stem,),
+                geometry_type=_geometry_type(placemarks),
+                feature_count=len(placemarks),
+                style_usage=usage,
+                standard_style_key=standard,
+                standard_style_xml=standard_xml,
+                standard_style_ambiguous=ambiguous,
+            )
+            if implicit.is_effective_layer:
+                result.append(implicit)
+
+    log.info(
+        "ANALYZE FILE COMPLETE: folders=%d effective_layers=%d containers_or_empty=%d",
+        len(parsed),
+        len(result),
+        len(parsed) - len(result),
+    )
     return KMLFileInfo(file_path=path, folders=result)
 
 
