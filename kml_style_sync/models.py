@@ -51,7 +51,7 @@ class FolderInfo:
 
 @dataclass(slots=True)
 class KMLFileInfo:
-    """One selected KML/KMZ file and all parsed effective Folders."""
+    """One selected KML/KMZ file and its effective layers."""
 
     file_path: Path
     folders: list[FolderInfo] = field(default_factory=list)
@@ -59,8 +59,8 @@ class KMLFileInfo:
 
 @dataclass(slots=True)
 class MatchRow:
-    """One B-standard effective-layer row with the current A assignment."""
+    """One A effective-layer task row with an optional B standard-layer mapping."""
 
-    template: FolderInfo
-    source: FolderInfo | None = None
+    template: FolderInfo | None
+    source: FolderInfo
     status: MatchStatus = "UNMATCHED"
