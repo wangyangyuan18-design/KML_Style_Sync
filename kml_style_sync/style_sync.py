@@ -26,6 +26,7 @@ class SyncResult:
     output_path: Path
     placemarks_changed: int
     styles_changed: int
+    folder_names_changed: int
     warnings: list[str]
 
 
@@ -233,7 +234,13 @@ def _prepare_style_for_kmz(
     return clone
 
 
-def sync_file(source: Path, template: Path, output: Path, mappings: dict[tuple[str, ...], tuple[str, ...]]) -> SyncResult:
+def sync_file(
+    source: Path,
+    template: Path,
+    output: Path,
+    mappings: dict[tuple[str, ...], tuple[str, ...]],
+    sync_folder_names: bool = False,
+) -> SyncResult:
     source = Path(source)
     template = Path(template)
     output = Path(output)
@@ -254,6 +261,7 @@ def sync_file(source: Path, template: Path, output: Path, mappings: dict[tuple[s
     warnings: list[str] = []
     changed = 0
     changed_styles = 0
+    folder_names_changed = 0
     template_archive: zipfile.ZipFile | None = None
     asset_payloads: dict[str, bytes] = {}
     asset_map: dict[str, str] = {}
@@ -269,6 +277,22 @@ def sync_file(source: Path, template: Path, output: Path, mappings: dict[tuple[s
             if template_folder is None:
                 warnings.append(f"B Folder 不存在：{label}")
                 continue
+            if sync_folder_names:
+                source_folder_for_name = source_folders.get(source_path)
+                template_name = (template_folder.findtext(q("name")) or "").strip()
+                if source_folder_for_name is None:
+                    warnings.append(f"A Folder 不存在，无法同步名称：{' / '.join(source_path)}")
+                elif template_name:
+                    source_name_element = source_folder_for_name.find(q("name"))
+                    old_name = (source_name_element.text or "").strip() if source_name_element is not None else ""
+                    if old_name != template_name:
+                        if source_name_element is None:
+                            source_name_element = etree.Element(q("name"))
+                            source_folder_for_name.insert(0, source_name_element)
+                        source_name_element.text = template_name
+                        folder_names_changed += 1
+                        log.info("FOLDER NAME SYNCED A=%s -> %s", " / ".join(source_path), template_name)
+
             standard, error = _standard_style_for_folder(
                 tpl_root, template_folder, label, template_styles, template_stylemaps
             )
@@ -312,4 +336,4 @@ def sync_file(source: Path, template: Path, output: Path, mappings: dict[tuple[s
         if template_archive is not None:
             template_archive.close()
 
-    return SyncResult(output, changed, changed_styles, warnings)
+    return SyncResult(output, changed, changed_styles, folder_names_changed, warnings)
