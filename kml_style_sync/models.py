@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Literal
 
 GeometryType = Literal["POINT", "LINE", "POLYGON", "MIXED", "UNKNOWN"]
-MatchStatus = Literal["AUTO_MATCHED", "MANUAL_MATCHED", "UNMATCHED", "AMBIGUOUS"]
+MatchStatus = Literal["EXACT_MATCHED", "SMART_MATCHED", "MANUAL_MATCHED", "UNMATCHED", "AMBIGUOUS"]
 
 
 @dataclass(slots=True)
@@ -64,3 +64,4 @@ class MatchRow:
     template: FolderInfo | None
     source: FolderInfo
     status: MatchStatus = "UNMATCHED"
+    confidence: float = 0.0
