@@ -239,7 +239,7 @@ def sync_file(
     template: Path,
     output: Path,
     mappings: dict[tuple[str, ...], tuple[str, ...]],
-    sync_folder_names: bool = False,
+    use_template_folder_structure: bool = False,
 ) -> SyncResult:
     source = Path(source)
     template = Path(template)
@@ -258,6 +258,12 @@ def sync_file(
     template_stylemaps = _collect_stylemaps(tpl_root)
     template_folders = _folder_index(tpl_root)
     source_folders = _folder_index(src_root)
+
+    # Optional structural mode: B is the output folder template.
+    # All B folders are preserved; matched A Placemark content is copied
+    # into the corresponding B folders.
+    output_root = copy.deepcopy(tpl_root) if use_template_folder_structure else src_root
+    output_folders = _folder_index(output_root)
     warnings: list[str] = []
     changed = 0
     changed_styles = 0
@@ -277,21 +283,27 @@ def sync_file(
             if template_folder is None:
                 warnings.append(f"B Folder 不存在：{label}")
                 continue
-            if sync_folder_names:
-                source_folder_for_name = source_folders.get(source_path)
-                template_name = (template_folder.findtext(q("name")) or "").strip()
-                if source_folder_for_name is None:
-                    warnings.append(f"A Folder 不存在，无法同步名称：{' / '.join(source_path)}")
-                elif template_name:
-                    source_name_element = source_folder_for_name.find(q("name"))
-                    old_name = (source_name_element.text or "").strip() if source_name_element is not None else ""
-                    if old_name != template_name:
-                        if source_name_element is None:
-                            source_name_element = etree.Element(q("name"))
-                            source_folder_for_name.insert(0, source_name_element)
-                        source_name_element.text = template_name
-                        folder_names_changed += 1
-                        log.info("FOLDER NAME SYNCED A=%s -> %s", " / ".join(source_path), template_name)
+            if use_template_folder_structure:
+                source_folder = source_folders.get(source_path)
+                target_folder = output_folders.get(template_path_value)
+                if source_folder is None or target_folder is None:
+                    warnings.append(f"无法迁入 Folder 内容：A {' / '.join(source_path)} -> B {label}")
+                    continue
+
+                # Keep B's complete hierarchy. For a matched effective folder,
+                # replace only its direct Placemark content with A's content.
+                for pm in list(target_folder.xpath("./k:Placemark", namespaces=NSMAP)):
+                    target_folder.remove(pm)
+
+                moved_count = 0
+                for pm in source_folder.xpath("./k:Placemark", namespaces=NSMAP):
+                    target_folder.append(copy.deepcopy(pm))
+                    moved_count += 1
+                folder_names_changed += moved_count
+                log.info(
+                    "CONTENT COPIED INTO B FOLDER A=%s -> B=%s placemarks=%d",
+                    " / ".join(source_path), label, moved_count
+                )
 
             standard, error = _standard_style_for_folder(
                 tpl_root, template_folder, label, template_styles, template_stylemaps
@@ -305,17 +317,24 @@ def sync_file(
                 standard_for_output = _prepare_style_for_kmz(
                     standard, template, template_archive, asset_payloads, asset_map, warnings
                 )
-                source_folder = source_folders.get(source_path)
-                if source_folder is None:
-                    warnings.append(f"A Folder 不存在：{' / '.join(source_path)}")
-                    continue
-                file_changed = 0
-                for pm in source_folder.xpath("./k:Placemark", namespaces=NSMAP):
-                    _replace_style(pm, standard_for_output)
-                    file_changed += 1
             else:
                 standard_for_output = copy.deepcopy(standard)
-                file_changed = _apply_to_folder(src_root, source_path, standard_for_output)
+
+            target_folder = (
+                output_folders.get(template_path_value)
+                if use_template_folder_structure
+                else source_folders.get(source_path)
+            )
+            if target_folder is None:
+                warnings.append(
+                    f"输出 Folder 不存在：{' / '.join(template_path_value if use_template_folder_structure else source_path)}"
+                )
+                continue
+
+            file_changed = 0
+            for pm in target_folder.xpath("./k:Placemark", namespaces=NSMAP):
+                _replace_style(pm, standard_for_output)
+                file_changed += 1
 
             changed += file_changed
             changed_styles += 1 if file_changed else 0
@@ -323,11 +342,11 @@ def sync_file(
 
         output.parent.mkdir(parents=True, exist_ok=True)
         if source.suffix.lower() == ".kml":
-            output.write_bytes(_serialize(src_root))
+            output.write_bytes(_serialize(output_root))
         else:
             with zipfile.ZipFile(source, "r") as zin, zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as zout:
                 for item in zin.infolist():
-                    data = _serialize(src_root) if item.filename == src_kml_name else zin.read(item.filename)
+                    data = _serialize(output_root) if item.filename == src_kml_name else zin.read(item.filename)
                     zout.writestr(item, data)
                 for asset_name, data in asset_payloads.items():
                     if asset_name not in zin.namelist():

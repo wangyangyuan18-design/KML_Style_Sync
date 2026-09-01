@@ -226,9 +226,9 @@ class MainWindow(QMainWindow):
         hint.setStyleSheet("color: #555;")
         layout.addWidget(hint)
 
-        self.sync_folder_names_checkbox = QCheckBox("同步 Folder 名称（B → A，可选）")
+        self.sync_folder_names_checkbox = QCheckBox("按 B 标准库重建 Folder 结构（可选）")
         self.sync_folder_names_checkbox.setChecked(False)
-        self.sync_folder_names_checkbox.setToolTip("勾选后，仅对已建立 A→B 映射的 Folder，将 B 标准库对应 Folder 的名称同步到输出文件中的 A Folder。未勾选时保持 A 原名称不变。")
+        self.sync_folder_names_checkbox.setToolTip("勾选后，以 B 标准文件的完整 Folder 层级作为输出结构，将 A 中已匹配 Folder 的 Placemark 内容迁入对应的 B Folder；B 中未匹配的外层、内层和空 Folder 全部保留。未勾选时保持原 A Folder 结构。")
         layout.addWidget(self.sync_folder_names_checkbox)
 
         library_head = QHBoxLayout()
@@ -681,7 +681,7 @@ class MainWindow(QMainWindow):
                 self.template_info.file_path,
                 output_path,
                 mappings,
-                sync_folder_names=self.sync_folder_names_checkbox.isChecked(),
+                use_template_folder_structure=self.sync_folder_names_checkbox.isChecked(),
             )
         except Exception as exc:
             self.loading_label.setText("")
@@ -696,7 +696,7 @@ class MainWindow(QMainWindow):
             f"手动匹配：{sum(row.status == 'MANUAL_MATCHED' for row in self.rows)}\n"
             f"修改 Placemark：{result.placemarks_changed}\n"
             f"同步 Style：{result.styles_changed}\n"
-            f"同步 Folder 名称：{result.folder_names_changed}\n"
+            f"迁入 B Folder 内容：{result.folder_names_changed}\n"
             f"输出：{result.output_path}"
         )
         if result.warnings:
