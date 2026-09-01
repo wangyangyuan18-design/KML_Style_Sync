@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QLineEdit,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
@@ -39,6 +40,31 @@ from .template_store import (
     template_path,
     template_root,
 )
+
+
+class NoWheelComboBox(QComboBox):
+    """Prevent accidental selection changes while the page is being scrolled."""
+    def wheelEvent(self, event) -> None:
+        event.ignore()
+
+
+class SearchableComboBox(NoWheelComboBox):
+    """Editable search box with recommended candidates kept at the top."""
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setEditable(True)
+        self.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.setMaxVisibleItems(14)
+        edit = self.lineEdit()
+        if edit:
+            edit.setPlaceholderText("点击后输入搜索…")
+            edit.textEdited.connect(self._filter_items)
+
+    def _filter_items(self, text: str) -> None:
+        query = text.strip().lower()
+        for i in range(self.count()):
+            label = self.itemText(i).lower()
+            self.view().setRowHidden(i, bool(query) and query not in label)
 
 
 class AnalysisWorker(QObject):
@@ -194,7 +220,7 @@ class MainWindow(QMainWindow):
         b_row = QHBoxLayout()
         b_row.setSpacing(6)
         b_row.addWidget(QLabel("B 标准："))
-        self.template_combo = QComboBox()
+        self.template_combo = NoWheelComboBox()
         self.template_combo.setMinimumWidth(220)
         self.template_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.template_combo.currentIndexChanged.connect(self._on_template_choice)
@@ -262,8 +288,8 @@ class MainWindow(QMainWindow):
         task_head.addWidget(title)
         task_head.addStretch(1)
         task_head.addWidget(QLabel("状态筛选："))
-        self.status_filter = QComboBox()
-        self.status_filter.addItems(["全部", "未匹配", "自动匹配", "手动匹配"])
+        self.status_filter = NoWheelComboBox()
+        self.status_filter.addItems(["全部", "未匹配", "完全匹配", "智能匹配", "手动匹配"])
         self.status_filter.setFixedWidth(105)
         self.status_filter.currentIndexChanged.connect(self._apply_status_filter)
         task_head.addWidget(self.status_filter)
@@ -515,7 +541,7 @@ class MainWindow(QMainWindow):
         self._set_library_table_column_modes()
 
     def _make_b_combo(self, row_index: int, source: FolderInfo, selected: FolderInfo | None) -> QComboBox:
-        combo = QComboBox()
+        combo = SearchableComboBox()
         combo.setMinimumWidth(0)
         combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
@@ -540,6 +566,7 @@ class MainWindow(QMainWindow):
         row = self.rows[row_index]
         row.template = combo.currentData()
         row.status = "UNMATCHED" if row.template is None else "MANUAL_MATCHED"
+        row.confidence = 1.0 if row.template is not None else row.confidence
         self._update_row_cells(row_index, row)
         self._update_summary()
 
@@ -549,8 +576,10 @@ class MainWindow(QMainWindow):
         self.table.setItem(row_index, 4, self._readonly_item(self._style_text(template) if template else "—"))
         if template is None:
             status = "⚠ 名称重复，需手动选择" if row.status == "AMBIGUOUS" else "— 未匹配"
-        elif row.status == "AUTO_MATCHED":
-            status = "✓ 自动匹配"
+        elif row.status == "EXACT_MATCHED":
+            status = "🟢 完全匹配"
+        elif row.status == "SMART_MATCHED":
+            status = f"🟡 智能推荐 {row.confidence * 100:.0f}%"
         else:
             status = "✓ 手动匹配"
         self.table.setItem(row_index, 5, self._readonly_item(status))
@@ -561,12 +590,13 @@ class MainWindow(QMainWindow):
             return
         a_total = len(self.source_info.folders)
         b_total = len(self.template_info.folders)
-        auto_count = sum(row.template is not None and row.status == "AUTO_MATCHED" for row in self.rows)
+        exact_count = sum(row.template is not None and row.status == "EXACT_MATCHED" for row in self.rows)
+        smart_count = sum(row.template is not None and row.status == "SMART_MATCHED" for row in self.rows)
         manual_count = sum(row.template is not None and row.status == "MANUAL_MATCHED" for row in self.rows)
         unmatched_count = sum(row.template is None for row in self.rows)
         self.info.setText(
             f"A 有效图层：{a_total} | B 有效图层：{b_total} | "
-            f"自动匹配：{auto_count} | 手动匹配：{manual_count} | A 未匹配：{unmatched_count}"
+            f"完全匹配：{exact_count} | 智能匹配：{smart_count} | 手动匹配：{manual_count} | A 未匹配：{unmatched_count}"
         )
 
     def _apply_status_filter(self) -> None:
@@ -576,8 +606,10 @@ class MainWindow(QMainWindow):
                 visible = True
             elif selected == "未匹配":
                 visible = row.template is None
-            elif selected == "自动匹配":
-                visible = row.template is not None and row.status == "AUTO_MATCHED"
+            elif selected == "完全匹配":
+                visible = row.template is not None and row.status == "EXACT_MATCHED"
+            elif selected == "智能匹配":
+                visible = row.template is not None and row.status == "SMART_MATCHED"
             else:
                 visible = row.template is not None and row.status == "MANUAL_MATCHED"
             self.table.setRowHidden(row_index, not visible)
@@ -590,7 +622,7 @@ class MainWindow(QMainWindow):
             return
 
         previous_by_a = {
-            row.source.folder_path: (row.template, row.status)
+            row.source.folder_path: (row.template, row.status, row.confidence)
             for row in self.rows
         } if preserve_current else {}
 
@@ -599,7 +631,7 @@ class MainWindow(QMainWindow):
             for row in self.rows:
                 previous = previous_by_a.get(row.source.folder_path)
                 if previous is not None:
-                    row.template, row.status = previous
+                    row.template, row.status, row.confidence = previous
 
         self._populate_library()
         self.table.setRowCount(len(self.rows))
@@ -692,7 +724,8 @@ class MainWindow(QMainWindow):
         msg = (
             "同步完成\n\n"
             f"A 有效图层：{len(self.source_info.folders)}\n"
-            f"自动匹配：{sum(row.status == 'AUTO_MATCHED' for row in self.rows)}\n"
+            f"完全匹配：{sum(row.status == 'EXACT_MATCHED' for row in self.rows)}\n"
+            f"智能匹配：{sum(row.status == 'SMART_MATCHED' for row in self.rows)}\n"
             f"手动匹配：{sum(row.status == 'MANUAL_MATCHED' for row in self.rows)}\n"
             f"修改 Placemark：{result.placemarks_changed}\n"
             f"同步 Style：{result.styles_changed}\n"
