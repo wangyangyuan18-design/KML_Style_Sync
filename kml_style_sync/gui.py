@@ -6,6 +6,7 @@ from PySide6.QtCore import QObject, QThread, Qt, QUrl, Signal, Slot
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -224,6 +225,11 @@ class MainWindow(QMainWindow):
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #555;")
         layout.addWidget(hint)
+
+        self.sync_folder_names_checkbox = QCheckBox("同步 Folder 名称（B → A，可选）")
+        self.sync_folder_names_checkbox.setChecked(False)
+        self.sync_folder_names_checkbox.setToolTip("勾选后，仅对已建立 A→B 映射的 Folder，将 B 标准库对应 Folder 的名称同步到输出文件中的 A Folder。未勾选时保持 A 原名称不变。")
+        layout.addWidget(self.sync_folder_names_checkbox)
 
         library_head = QHBoxLayout()
         library_head.setSpacing(4)
@@ -670,7 +676,13 @@ class MainWindow(QMainWindow):
         self.loading_label.setText("正在同步 Style …")
         QApplication.processEvents()
         try:
-            result = sync_file(self.source_info.file_path, self.template_info.file_path, output_path, mappings)
+            result = sync_file(
+                self.source_info.file_path,
+                self.template_info.file_path,
+                output_path,
+                mappings,
+                sync_folder_names=self.sync_folder_names_checkbox.isChecked(),
+            )
         except Exception as exc:
             self.loading_label.setText("")
             QMessageBox.critical(self, "同步失败", str(exc))
@@ -684,6 +696,7 @@ class MainWindow(QMainWindow):
             f"手动匹配：{sum(row.status == 'MANUAL_MATCHED' for row in self.rows)}\n"
             f"修改 Placemark：{result.placemarks_changed}\n"
             f"同步 Style：{result.styles_changed}\n"
+            f"同步 Folder 名称：{result.folder_names_changed}\n"
             f"输出：{result.output_path}"
         )
         if result.warnings:
