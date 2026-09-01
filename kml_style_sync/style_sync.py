@@ -264,6 +264,17 @@ def sync_file(
     # into the corresponding B folders.
     output_root = copy.deepcopy(tpl_root) if use_template_folder_structure else src_root
     output_folders = _folder_index(output_root)
+
+    # In structural mode B contributes only the Folder hierarchy, names and
+    # style definitions. Its actual map features must never leak into output.
+    # Clear all direct feature content first, while preserving every Folder,
+    # Document and other structural node.
+    if use_template_folder_structure:
+        for folder in output_folders.values():
+            for child in list(folder):
+                if etree.QName(child).localname in {"Placemark", "GroundOverlay", "ScreenOverlay", "PhotoOverlay"}:
+                    folder.remove(child)
+
     warnings: list[str] = []
     changed = 0
     changed_styles = 0
@@ -289,11 +300,6 @@ def sync_file(
                 if source_folder is None or target_folder is None:
                     warnings.append(f"无法迁入 Folder 内容：A {' / '.join(source_path)} -> B {label}")
                     continue
-
-                # Keep B's complete hierarchy. For a matched effective folder,
-                # replace only its direct Placemark content with A's content.
-                for pm in list(target_folder.xpath("./k:Placemark", namespaces=NSMAP)):
-                    target_folder.remove(pm)
 
                 moved_count = 0
                 for pm in source_folder.xpath("./k:Placemark", namespaces=NSMAP):
