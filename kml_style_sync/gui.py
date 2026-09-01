@@ -55,6 +55,7 @@ class SearchableComboBox(NoWheelComboBox):
         self.setEditable(True)
         self.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         self.setMaxVisibleItems(14)
+        self._all_visible = True
         edit = self.lineEdit()
         if edit:
             edit.setPlaceholderText("点击后输入搜索…")
@@ -65,6 +66,7 @@ class SearchableComboBox(NoWheelComboBox):
         for i in range(self.count()):
             label = self.itemText(i).lower()
             self.view().setRowHidden(i, bool(query) and query not in label)
+        self._all_visible = not bool(query)
 
 
 class AnalysisWorker(QObject):
@@ -548,8 +550,9 @@ class MainWindow(QMainWindow):
         combo.setMinimumContentsLength(12)
         combo.addItem("— 未匹配：选择 B 标准 Folder —", None)
         candidates = candidates_for(source, self.template_info.folders if self.template_info else [])
-        for template in candidates:
-            combo.addItem(template.display_path, template)
+        for rank, template in enumerate(candidates):
+            prefix = "⭐ " if rank < 3 else ""
+            combo.addItem(prefix + template.display_path, template)
         if selected is not None:
             for idx in range(combo.count()):
                 if combo.itemData(idx) is selected:
