@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -10,19 +11,51 @@ from .logger import get_logger
 log = get_logger()
 
 
+MAPPING_FILENAME = "KML_Style_Mapping.json"
+LEGACY_FILENAME = "folder_mappings.json"
+
+
 def mapping_root() -> Path:
+    """Return the application data directory used only as a fallback.
+
+    The primary mapping file is kept beside the EXE/project code so that all A
+    projects share one cumulative, portable mapping table and the file can be
+    copied to another PC together with the application.
+    """
     base = os.environ.get("APPDATA") or os.environ.get("LOCALAPPDATA") or str(Path.home())
     path = Path(base) / "KML_Style_Sync"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
+def _portable_mapping_path() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent / MAPPING_FILENAME
+    # Development mode: keep the same file at the repository/application root.
+    return Path(__file__).resolve().parent.parent / MAPPING_FILENAME
+
+
 def mapping_path() -> Path:
-    return mapping_root() / "folder_mappings.json"
+    """Single cumulative mapping table shared by all A files.
+
+    Prefer the portable file beside the EXE. If that directory is not writable,
+    transparently fall back to the existing per-user application-data location.
+    """
+    portable = _portable_mapping_path()
+    try:
+        portable.parent.mkdir(parents=True, exist_ok=True)
+        if portable.exists() or os.access(portable.parent, os.W_OK):
+            return portable
+    except Exception:
+        pass
+    return mapping_root() / MAPPING_FILENAME
 
 
-def _read() -> dict[str, Any]:
-    path = mapping_path()
+def _legacy_mapping_path() -> Path:
+    return mapping_root() / LEGACY_FILENAME
+
+
+def _read_file(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
     try:
@@ -31,6 +64,22 @@ def _read() -> dict[str, Any]:
     except Exception as exc:
         log.warning("FOLDER MAPPING READ FAILED: %s", exc)
         return {}
+
+
+def _read() -> dict[str, Any]:
+    path = mapping_path()
+    data = _read_file(path)
+    if data:
+        return data
+
+    # One-time compatibility: retain mappings created by older builds.
+    legacy = _read_file(_legacy_mapping_path())
+    if legacy:
+        try:
+            _write(legacy)
+        except Exception:
+            pass
+    return legacy
 
 
 def _write(data: dict[str, Any]) -> None:
