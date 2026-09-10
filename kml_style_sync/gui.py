@@ -206,7 +206,6 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(8, 7, 8, 7)
         layout.setSpacing(6)
 
-        # A / B file selection area: one compact row each, with no oversized gaps.
         a_row = QHBoxLayout()
         a_row.setSpacing(6)
         a_row.addWidget(QLabel("A 工程："))
@@ -282,7 +281,6 @@ class MainWindow(QMainWindow):
         self.library_panel.setVisible(False)
         layout.addWidget(self.library_panel)
 
-        # Main A task table.
         task_head = QHBoxLayout()
         task_head.setSpacing(5)
         title = QLabel("A 工程 Style 同步任务")
@@ -291,7 +289,7 @@ class MainWindow(QMainWindow):
         task_head.addStretch(1)
         task_head.addWidget(QLabel("状态筛选："))
         self.status_filter = NoWheelComboBox()
-        self.status_filter.addItems(["全部", "未匹配", "完全匹配", "智能匹配", "手动匹配"])
+        self.status_filter.addItems(["全部", "未匹配", "完全匹配", "智能匹配", "历史匹配", "手动匹配"])
         self.status_filter.setFixedWidth(105)
         self.status_filter.currentIndexChanged.connect(self._apply_status_filter)
         task_head.addWidget(self.status_filter)
@@ -309,7 +307,6 @@ class MainWindow(QMainWindow):
         self._configure_table(self.table, row_height=25)
         layout.addWidget(self.table, 1)
 
-        # Bottom bar is kept outside the expanding table so it remains visible.
         bottom = QHBoxLayout()
         bottom.setSpacing(8)
         self.info = QLabel("请先选择 A 工程和 B 标准模板")
@@ -343,7 +340,6 @@ class MainWindow(QMainWindow):
         for col in (0, 1, 3, 4, 5):
             header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-
         widths = {
             0: (250, 420),
             1: (75, 100),
@@ -389,7 +385,6 @@ class MainWindow(QMainWindow):
         button = self.source_button if kind == "A" else self.template_file_button
         button.setEnabled(False)
         self.loading_label.setText(f"正在解析 {kind}：{path.name} …")
-
         thread = QThread(self)
         worker = AnalysisWorker(kind, path, include_styles)
         worker.moveToThread(thread)
@@ -583,6 +578,8 @@ class MainWindow(QMainWindow):
             status = "🟢 完全匹配"
         elif row.status == "SMART_MATCHED":
             status = f"🟡 智能推荐 {row.confidence * 100:.0f}%"
+        elif row.status == "HISTORY_MATCHED":
+            status = "🔵 历史匹配"
         else:
             status = "✓ 手动匹配"
         self.table.setItem(row_index, 5, self._readonly_item(status))
@@ -595,11 +592,13 @@ class MainWindow(QMainWindow):
         b_total = len(self.template_info.folders)
         exact_count = sum(row.template is not None and row.status == "EXACT_MATCHED" for row in self.rows)
         smart_count = sum(row.template is not None and row.status == "SMART_MATCHED" for row in self.rows)
+        history_count = sum(row.template is not None and row.status == "HISTORY_MATCHED" for row in self.rows)
         manual_count = sum(row.template is not None and row.status == "MANUAL_MATCHED" for row in self.rows)
         unmatched_count = sum(row.template is None for row in self.rows)
         self.info.setText(
             f"A 有效图层：{a_total} | B 有效图层：{b_total} | "
-            f"完全匹配：{exact_count} | 智能匹配：{smart_count} | 手动匹配：{manual_count} | A 未匹配：{unmatched_count}"
+            f"完全匹配：{exact_count} | 智能匹配：{smart_count} | 历史匹配：{history_count} | "
+            f"手动匹配：{manual_count} | A 未匹配：{unmatched_count}"
         )
 
     def _apply_status_filter(self) -> None:
@@ -613,6 +612,8 @@ class MainWindow(QMainWindow):
                 visible = row.template is not None and row.status == "EXACT_MATCHED"
             elif selected == "智能匹配":
                 visible = row.template is not None and row.status == "SMART_MATCHED"
+            elif selected == "历史匹配":
+                visible = row.template is not None and row.status == "HISTORY_MATCHED"
             else:
                 visible = row.template is not None and row.status == "MANUAL_MATCHED"
             self.table.setRowHidden(row_index, not visible)
@@ -729,6 +730,7 @@ class MainWindow(QMainWindow):
             f"A 有效图层：{len(self.source_info.folders)}\n"
             f"完全匹配：{sum(row.status == 'EXACT_MATCHED' for row in self.rows)}\n"
             f"智能匹配：{sum(row.status == 'SMART_MATCHED' for row in self.rows)}\n"
+            f"历史匹配：{sum(row.status == 'HISTORY_MATCHED' for row in self.rows)}\n"
             f"手动匹配：{sum(row.status == 'MANUAL_MATCHED' for row in self.rows)}\n"
             f"修改 Placemark：{result.placemarks_changed}\n"
             f"同步 Style：{result.styles_changed}\n"
