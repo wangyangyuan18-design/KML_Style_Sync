@@ -259,21 +259,20 @@ def sync_file(
     template_folders = _folder_index(tpl_root)
     source_folders = _folder_index(src_root)
 
-    # Optional structural mode: B is the output folder template.
-    # All B folders are preserved; matched A Placemark content is copied
-    # into the corresponding B folders.
     output_root = copy.deepcopy(tpl_root) if use_template_folder_structure else src_root
     output_folders = _folder_index(output_root)
 
-    # In structural mode B contributes only the Folder hierarchy, names and
-    # style definitions. Its actual map features must never leak into output.
-    # Clear all direct feature content first, while preserving every Folder,
-    # Document and other structural node.
     if use_template_folder_structure:
-        for folder in output_folders.values():
-            for child in list(folder):
-                if etree.QName(child).localname in {"Placemark", "GroundOverlay", "ScreenOverlay", "PhotoOverlay"}:
-                    folder.remove(child)
+        # B supplies the complete Folder hierarchy and style definitions only.
+        # Remove EVERY map feature from B, regardless of whether it is directly
+        # under a Folder or nested elsewhere. This prevents template features
+        # from leaking into an empty A Folder.
+        feature_tags = {"Placemark", "GroundOverlay", "ScreenOverlay", "PhotoOverlay", "NetworkLink"}
+        for feature in output_root.xpath(".//*"):
+            if etree.QName(feature).localname in feature_tags:
+                parent = feature.getparent()
+                if parent is not None:
+                    parent.remove(feature)
 
     warnings: list[str] = []
     changed = 0
