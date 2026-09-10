@@ -7,7 +7,7 @@ from typing import Literal
 from .mapping_store import delete_mapping, save_mapping
 
 GeometryType = Literal["POINT", "LINE", "POLYGON", "MIXED", "UNKNOWN"]
-MatchStatus = Literal["EXACT_MATCHED", "SMART_MATCHED", "MANUAL_MATCHED", "UNMATCHED", "AMBIGUOUS"]
+MatchStatus = Literal["EXACT_MATCHED", "SMART_MATCHED", "HISTORY_MATCHED", "MANUAL_MATCHED", "UNMATCHED", "AMBIGUOUS"]
 
 
 @dataclass(slots=True)
