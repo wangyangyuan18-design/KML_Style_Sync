@@ -54,7 +54,7 @@ def build_match_rows(source_folders: list[FolderInfo], template_folders: list[Fo
         saved = _saved_template(source, template_folders)
         if saved is not None:
             rows.append(MatchRow(template=saved, source=source,
-                                 status="MANUAL_MATCHED", confidence=1.0))
+                                 status="HISTORY_MATCHED", confidence=1.0))
             continue
 
         exact = [f for f in template_folders
