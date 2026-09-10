@@ -3,6 +3,7 @@ from __future__ import annotations
 from difflib import SequenceMatcher
 
 from .kml_parser import normalize_name
+from .mapping_store import get_mapping
 from .models import FolderInfo, MatchRow
 
 
@@ -32,10 +33,30 @@ def ranked_candidates(source: FolderInfo, template_folders: list[FolderInfo]) ->
     return sorted(ranked, key=lambda item: item[1], reverse=True)
 
 
+def _saved_template(source: FolderInfo, template_folders: list[FolderInfo]) -> FolderInfo | None:
+    """Return the previously selected B Folder when it still exists and Geometry is unchanged."""
+    saved = get_mapping(source.folder_path, source.geometry_type)
+    if saved is None:
+        return None
+    target_path, target_geometry = saved
+    if target_geometry != source.geometry_type:
+        return None
+    for folder in template_folders:
+        if folder.geometry_type == target_geometry and folder.folder_path == target_path:
+            return folder
+    return None
+
+
 def build_match_rows(source_folders: list[FolderInfo], template_folders: list[FolderInfo]) -> list[MatchRow]:
-    """Exact matching first, then conservative smart recommendations."""
+    """Restore saved mappings first, then exact matching and conservative smart recommendations."""
     rows: list[MatchRow] = []
     for source in source_folders:
+        saved = _saved_template(source, template_folders)
+        if saved is not None:
+            rows.append(MatchRow(template=saved, source=source,
+                                 status="MANUAL_MATCHED", confidence=1.0))
+            continue
+
         exact = [f for f in template_folders
                  if f.geometry_type == source.geometry_type
                  and normalize_name(f.name) == normalize_name(source.name)]
