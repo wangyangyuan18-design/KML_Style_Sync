@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-from .mapping_store import save_mapping
+from .mapping_store import delete_mapping, save_mapping
 
 GeometryType = Literal["POINT", "LINE", "POLYGON", "MIXED", "UNKNOWN"]
 MatchStatus = Literal["EXACT_MATCHED", "SMART_MATCHED", "MANUAL_MATCHED", "UNMATCHED", "AMBIGUOUS"]
@@ -70,19 +70,22 @@ class MatchRow:
 
     def __setattr__(self, name: str, value: object) -> None:
         object.__setattr__(self, name, value)
-        if name != "status" or value != "MANUAL_MATCHED":
+        if name != "status":
             return
         source = getattr(self, "source", None)
         template = getattr(self, "template", None)
-        if source is None or template is None:
+        if source is None:
             return
         try:
-            save_mapping(
-                source.folder_path,
-                source.geometry_type,
-                template.folder_path,
-                template.geometry_type,
-            )
+            if value == "MANUAL_MATCHED" and template is not None:
+                save_mapping(
+                    source.folder_path,
+                    source.geometry_type,
+                    template.folder_path,
+                    template.geometry_type,
+                )
+            elif value == "UNMATCHED":
+                delete_mapping(source.folder_path, source.geometry_type)
         except Exception:
             # Mapping persistence must never block the actual style-sync workflow.
             pass
