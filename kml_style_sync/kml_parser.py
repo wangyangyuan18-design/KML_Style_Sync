@@ -25,8 +25,8 @@ def normalize_name(value: str) -> str:
     import re
 
     text = " ".join((value or "").strip().lower().split())
-    text = re.sub(r"\\s*=\\s*\\(\\s*\\d+\\s*\\)\\s*$", "", text)
-    text = re.sub(r"\\s*=\\s*\\d+\\s*$", "", text)
+    text = re.sub(r"\s*=\s*\(\s*\d+\s*\)\s*$", "", text)
+    text = re.sub(r"\s*=\s*\d+\s*$", "", text)
     return " ".join(text.split())
 
 
