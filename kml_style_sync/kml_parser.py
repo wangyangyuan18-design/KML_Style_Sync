@@ -15,7 +15,19 @@ log = get_logger()
 
 
 def normalize_name(value: str) -> str:
-    return " ".join(value.strip().lower().split())
+    """Normalize a KML Folder name for matching, ignoring terminal ODN counts.
+
+    Examples:
+        "Sdus=1012" -> "sdus"
+        "SUB BOX (70/30)=(12)" -> "sub box (70/30)"
+    The source XML is never renamed; this is comparison-only normalization.
+    """
+    import re
+
+    text = " ".join((value or "").strip().lower().split())
+    text = re.sub(r"\\s*=\\s*\\(\\s*\\d+\\s*\\)\\s*$", "", text)
+    text = re.sub(r"\\s*=\\s*\\d+\\s*$", "", text)
+    return " ".join(text.split())
 
 
 def _read_kml_bytes(path: Path) -> bytes:
